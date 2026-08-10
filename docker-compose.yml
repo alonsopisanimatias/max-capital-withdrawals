@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: withdrawals
+      POSTGRES_USER: withdrawals
+      POSTGRES_PASSWORD: withdrawals
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U withdrawals"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # backend-1, backend-2 and frontend are added in Block 9/12 once the app itself exists.
+
+volumes:
+  postgres-data:

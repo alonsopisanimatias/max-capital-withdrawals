@@ -1,0 +1,65 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.3.4'
+    id 'io.spring.dependency-management' version '1.1.6'
+}
+
+group = 'com.maxcapital'
+version = '0.0.1-SNAPSHOT'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+configurations {
+    compileOnly {
+        extendsFrom annotationProcessor
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+// Spring Boot 3.3.4's own BOM pins testcontainers-core to 1.19.8, which fails to talk to
+// current Docker Desktop versions (BadRequestException on /info). Override with a newer BOM.
+dependencyManagement {
+    imports {
+        mavenBom 'org.testcontainers:testcontainers-bom:1.21.3'
+    }
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.flywaydb:flyway-core'
+    implementation 'org.flywaydb:flyway-database-postgresql'
+    runtimeOnly 'org.postgresql:postgresql'
+
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+
+    testCompileOnly 'org.projectlombok:lombok'
+    testAnnotationProcessor 'org.projectlombok:lombok'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.testcontainers:junit-jupiter'
+    testImplementation 'org.testcontainers:postgresql'
+    testImplementation 'org.springframework.boot:spring-boot-testcontainers'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+    // Docker Desktop's daemon here enforces MinAPIVersion 1.44 (see `docker version`), but
+    // docker-java falls back to a hardcoded default (1.32) for some internal calls, which the
+    // daemon rejects with a malformed response instead of a clean error. Forcing it via the
+    // forked test JVM's own environment (not the Gradle daemon's env, which is unreliable to
+    // change after the daemon has started) fixes it for every docker-java call, not just some.
+    environment 'DOCKER_API_VERSION', '1.51'
+    systemProperty 'api.version', '1.51'
+    systemProperty 'DOCKER_API_VERSION', '1.51'
+}

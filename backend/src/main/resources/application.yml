@@ -1,0 +1,61 @@
+spring:
+  application:
+    name: withdrawals
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:withdrawals}
+    username: ${DB_USER:withdrawals}
+    password: ${DB_PASSWORD:withdrawals}
+    hikari:
+      # sized to cover the 3 poller threads + reconciliation + normal HTTP traffic,
+      # see PLAN_TECNICO_FINAL.md fix #1 (scheduling pool bottleneck)
+      maximum-pool-size: 15
+      minimum-idle: 5
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  task:
+    scheduling:
+      pool:
+        # default is 1, which serializes the 3 @Scheduled pollers on a single thread;
+        # see PLAN_TECNICO_FINAL.md fix #1
+        size: 4
+
+server:
+  port: ${SERVER_PORT:8080}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+# used only for logging, to show in the demo that both compose instances process distinct rows
+instance:
+  id: ${INSTANCE_ID:local}
+
+# tuning for the background pollers (SKIP LOCKED consumers)
+withdrawals:
+  poller:
+    risk-evaluation:
+      fixed-delay-ms: 1000
+      batch-size: 5
+    transfer-execution:
+      fixed-delay-ms: 1000
+      batch-size: 5
+      bank-call-timeout-seconds: 15
+    reconciliation:
+      fixed-delay-ms: 5000
+      batch-size: 5
+      grace-period-seconds: 30
