@@ -9,7 +9,9 @@ import com.maxcapital.withdrawals.external.RiskService;
 import com.maxcapital.withdrawals.repository.WithdrawalRepository;
 import com.maxcapital.withdrawals.repository.WithdrawalStatusHistoryRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
@@ -46,9 +48,19 @@ public class RiskEvaluationPoller {
     @Value("${withdrawals.poller.risk-evaluation.batch-size}")
     private int batchSize;
 
+    // self-injection through the Spring proxy: calling processBatch() as `this.processBatch()`
+    // (plain self-invocation) would bypass the AOP proxy entirely, silently dropping the
+    // @Transactional(REQUIRES_NEW) below — a classic Spring pitfall where the annotation
+    // compiles fine and simply never applies. Going through `self` routes the call back through
+    // the proxy so the transaction interceptor actually runs. @Lazy avoids a circular
+    // dependency while Spring is still constructing this very bean.
+    @Autowired
+    @Lazy
+    private RiskEvaluationPoller self;
+
     @Scheduled(fixedDelayString = "${withdrawals.poller.risk-evaluation.fixed-delay-ms}")
     public void tick() {
-        processBatch();
+        self.processBatch();
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)

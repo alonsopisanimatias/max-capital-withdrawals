@@ -44,4 +44,9 @@ public class WithdrawalController {
     public WithdrawalResponse reject(@PathVariable UUID id, @RequestHeader("X-Operator-Id") @NotBlank String operatorId) {
         return WithdrawalResponse.from(withdrawalService.reject(id, operatorId));
     }
+
+    @PostMapping("/{id}/retry")
+    public WithdrawalResponse retry(@PathVariable UUID id, @RequestHeader("X-Operator-Id") @NotBlank String operatorId) {
+        return WithdrawalResponse.from(withdrawalService.retry(id, operatorId));
+    }
 }

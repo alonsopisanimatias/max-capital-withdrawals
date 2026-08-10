@@ -1,2 +1,8 @@
 scheduling:
   enabled: false
+
+withdrawals:
+  poller:
+    reconciliation:
+      # short grace period so reconciliation tests don't need to sleep 30s to exercise it
+      grace-period-seconds: 2

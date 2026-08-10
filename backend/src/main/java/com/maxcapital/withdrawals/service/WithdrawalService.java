@@ -34,7 +34,7 @@ public class WithdrawalService {
      */
     @Transactional
     public Withdrawal authorize(UUID withdrawalId, String operatorId) {
-        Withdrawal withdrawal = loadForTransition(withdrawalId);
+        Withdrawal withdrawal = loadForTransition(withdrawalId, WithdrawalStatus.PENDING_AUTHORIZATION);
         WithdrawalStatus previousStatus = withdrawal.getStatus();
 
         withdrawal.setStatus(WithdrawalStatus.AUTHORIZED);
@@ -54,7 +54,7 @@ public class WithdrawalService {
      */
     @Transactional
     public Withdrawal reject(UUID withdrawalId, String operatorId) {
-        Withdrawal withdrawal = loadForTransition(withdrawalId);
+        Withdrawal withdrawal = loadForTransition(withdrawalId, WithdrawalStatus.PENDING_AUTHORIZATION);
         WithdrawalStatus previousStatus = withdrawal.getStatus();
 
         withdrawal.setStatus(WithdrawalStatus.REJECTED);
@@ -67,12 +67,33 @@ public class WithdrawalService {
         return withdrawal;
     }
 
-    private Withdrawal loadForTransition(UUID withdrawalId) {
+    /**
+     * Manually retries a withdrawal stuck in RETRYABLE_ERROR (the bank reported a transient
+     * internal error). Only flips the status back to AUTHORIZED — the transfer poller's own
+     * claim step reuses the existing transfer row and resets its status/requested_at when it
+     * picks this withdrawal up again, so there's nothing else to reset here. The reserved
+     * balance was never released for this outcome, so no account changes are needed either.
+     */
+    @Transactional
+    public Withdrawal retry(UUID withdrawalId, String operatorId) {
+        Withdrawal withdrawal = loadForTransition(withdrawalId, WithdrawalStatus.RETRYABLE_ERROR);
+        WithdrawalStatus previousStatus = withdrawal.getStatus();
+
+        withdrawal.setStatus(WithdrawalStatus.AUTHORIZED);
+        withdrawal.setUpdatedAt(Instant.now());
+        withdrawal.setUpdatedBy(operatorId);
+        withdrawalRepository.save(withdrawal);
+
+        recordTransition(withdrawal.getId(), previousStatus, WithdrawalStatus.AUTHORIZED, operatorId);
+        return withdrawal;
+    }
+
+    private Withdrawal loadForTransition(UUID withdrawalId, WithdrawalStatus expectedStatus) {
         Withdrawal withdrawal = withdrawalRepository.findById(withdrawalId)
                 .orElseThrow(() -> new EntityNotFoundException("Withdrawal not found: " + withdrawalId));
-        if (withdrawal.getStatus() != WithdrawalStatus.PENDING_AUTHORIZATION) {
+        if (withdrawal.getStatus() != expectedStatus) {
             throw new InvalidTransitionException(
-                    "Withdrawal " + withdrawalId + " is not pending authorization (current status: " + withdrawal.getStatus() + ")",
+                    "Withdrawal " + withdrawalId + " is not in " + expectedStatus + " (current status: " + withdrawal.getStatus() + ")",
                     withdrawalId, withdrawal.getStatus(), withdrawal.getUpdatedBy());
         }
         return withdrawal;
