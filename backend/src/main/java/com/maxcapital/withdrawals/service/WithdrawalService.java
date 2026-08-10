@@ -26,6 +26,64 @@ public class WithdrawalService {
     private final WithdrawalStatusHistoryRepository historyRepository;
 
     /**
+     * Authorizes a withdrawal pending manual review. The precondition check (status must be
+     * PENDING_AUTHORIZATION) defends against acting on the wrong state at all; @Version is
+     * what actually resolves a race between two operators deterministically (C4) — whichever
+     * request's UPDATE commits first wins, the other fails the version check on flush and
+     * throws ObjectOptimisticLockingFailureException (mapped to 409 in GlobalExceptionHandler).
+     */
+    @Transactional
+    public Withdrawal authorize(UUID withdrawalId, String operatorId) {
+        Withdrawal withdrawal = loadForTransition(withdrawalId);
+        WithdrawalStatus previousStatus = withdrawal.getStatus();
+
+        withdrawal.setStatus(WithdrawalStatus.AUTHORIZED);
+        withdrawal.setUpdatedAt(Instant.now());
+        withdrawal.setUpdatedBy(operatorId);
+        withdrawalRepository.save(withdrawal);
+
+        recordTransition(withdrawal.getId(), previousStatus, WithdrawalStatus.AUTHORIZED, operatorId);
+        return withdrawal;
+    }
+
+    /**
+     * Rejects a withdrawal and releases its reserved balance in the SAME transaction as the
+     * status transition — if these were split (e.g. release in a separate REQUIRES_NEW), the
+     * loser of a C4 race could still release reserve for a withdrawal an operator just
+     * authorized, since REQUIRES_NEW wouldn't roll back alongside the failed status update.
+     */
+    @Transactional
+    public Withdrawal reject(UUID withdrawalId, String operatorId) {
+        Withdrawal withdrawal = loadForTransition(withdrawalId);
+        WithdrawalStatus previousStatus = withdrawal.getStatus();
+
+        withdrawal.setStatus(WithdrawalStatus.REJECTED);
+        withdrawal.setUpdatedAt(Instant.now());
+        withdrawal.setUpdatedBy(operatorId);
+        withdrawalRepository.save(withdrawal);
+        accountRepository.release(withdrawal.getAccountId(), withdrawal.getAmount());
+
+        recordTransition(withdrawal.getId(), previousStatus, WithdrawalStatus.REJECTED, operatorId);
+        return withdrawal;
+    }
+
+    private Withdrawal loadForTransition(UUID withdrawalId) {
+        Withdrawal withdrawal = withdrawalRepository.findById(withdrawalId)
+                .orElseThrow(() -> new EntityNotFoundException("Withdrawal not found: " + withdrawalId));
+        if (withdrawal.getStatus() != WithdrawalStatus.PENDING_AUTHORIZATION) {
+            throw new InvalidTransitionException(
+                    "Withdrawal " + withdrawalId + " is not pending authorization (current status: " + withdrawal.getStatus() + ")",
+                    withdrawalId, withdrawal.getStatus(), withdrawal.getUpdatedBy());
+        }
+        return withdrawal;
+    }
+
+    private void recordTransition(UUID withdrawalId, WithdrawalStatus previousStatus, WithdrawalStatus newStatus, String actor) {
+        historyRepository.save(new WithdrawalStatusHistory(
+                UUID.randomUUID(), withdrawalId, previousStatus, newStatus, actor, Instant.now()));
+    }
+
+    /**
      * Reserves the requested amount and creates the withdrawal in EVALUATING_RISK. The
      * reservation and the insert happen in the same transaction: if anything after the
      * reservation fails, the reservation itself rolls back too (no leaked reserved balance).
@@ -52,9 +110,7 @@ public class WithdrawalService {
         withdrawal.setUpdatedAt(now);
         withdrawal.setUpdatedBy(ACTOR_CLIENT);
         withdrawalRepository.save(withdrawal);
-
-        historyRepository.save(new WithdrawalStatusHistory(
-                UUID.randomUUID(), withdrawal.getId(), null, WithdrawalStatus.EVALUATING_RISK, ACTOR_CLIENT, now));
+        recordTransition(withdrawal.getId(), null, WithdrawalStatus.EVALUATING_RISK, ACTOR_CLIENT);
 
         return withdrawal;
     }
