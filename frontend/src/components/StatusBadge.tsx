@@ -1,18 +1,22 @@
 import type { WithdrawalStatus } from '../api/types';
+import { STATUS_LABELS, STATUS_TOOLTIPS } from '../labels';
 
-const STATUS_META: Record<WithdrawalStatus, { label: string; className: string }> = {
-  EVALUATING_RISK: { label: 'Evaluando riesgo', className: 'badge-neutral' },
-  PENDING_AUTHORIZATION: { label: 'Pendiente autorización', className: 'badge-warning' },
-  AUTHORIZED: { label: 'Autorizado', className: 'badge-info' },
-  REJECTED: { label: 'Rechazado', className: 'badge-negative' },
-  PROCESSING_TRANSFER: { label: 'Procesando transferencia', className: 'badge-info' },
-  EXECUTED: { label: 'Ejecutado', className: 'badge-positive' },
-  FINAL_ERROR: { label: 'Error final', className: 'badge-negative' },
-  RETRYABLE_ERROR: { label: 'Reintentable', className: 'badge-warning' },
-  MANUAL_REVIEW: { label: 'Revisión manual', className: 'badge-negative' },
+const STATUS_CLASSNAMES: Record<WithdrawalStatus, string> = {
+  EVALUATING_RISK: 'badge-neutral',
+  PENDING_AUTHORIZATION: 'badge-warning',
+  AUTHORIZED: 'badge-info',
+  REJECTED: 'badge-negative',
+  PROCESSING_TRANSFER: 'badge-info',
+  EXECUTED: 'badge-positive',
+  FINAL_ERROR: 'badge-negative',
+  RETRYABLE_ERROR: 'badge-warning',
+  MANUAL_REVIEW: 'badge-negative',
 };
 
 export function StatusBadge({ status }: { status: WithdrawalStatus }) {
-  const meta = STATUS_META[status];
-  return <span className={`badge ${meta.className}`}>{meta.label}</span>;
+  return (
+    <span className={`badge ${STATUS_CLASSNAMES[status]}`} title={STATUS_TOOLTIPS[status]}>
+      {STATUS_LABELS[status]}
+    </span>
+  );
 }

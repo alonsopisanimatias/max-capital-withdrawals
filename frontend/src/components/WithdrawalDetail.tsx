@@ -1,6 +1,7 @@
 import { useWithdrawal } from '../hooks/useWithdrawal';
 import { useWithdrawalActions } from '../hooks/useWithdrawalActions';
 import { StatusBadge } from './StatusBadge';
+import { actorLabel, RISK_LABELS, STATUS_LABELS, TRANSFER_STATUS_LABELS } from '../labels';
 
 interface Props {
   id: string;
@@ -57,7 +58,7 @@ export function WithdrawalDetail({ id, operatorId, onClose }: Props) {
             </div>
             <div className="field-row">
               <span className="label">Riesgo</span>
-              <span className="value">{withdrawal.riskLevel ?? '—'}</span>
+              <span className="value">{withdrawal.riskLevel ? RISK_LABELS[withdrawal.riskLevel] : '—'}</span>
             </div>
             <div className="field-row">
               <span className="label">Creado</span>
@@ -66,7 +67,7 @@ export function WithdrawalDetail({ id, operatorId, onClose }: Props) {
             <div className="field-row">
               <span className="label">Actualizado</span>
               <span className="value">
-                {formatDate(withdrawal.updatedAt)} ({withdrawal.updatedBy ?? '—'})
+                {formatDate(withdrawal.updatedAt)} ({withdrawal.updatedBy ? actorLabel(withdrawal.updatedBy) : '—'})
               </span>
             </div>
 
@@ -75,7 +76,7 @@ export function WithdrawalDetail({ id, operatorId, onClose }: Props) {
                 <div className="section-title">Transferencia</div>
                 <div className="field-row">
                   <span className="label">Estado</span>
-                  <span className="value">{withdrawal.transfer.status}</span>
+                  <span className="value">{TRANSFER_STATUS_LABELS[withdrawal.transfer.status]}</span>
                 </div>
                 <div className="field-row">
                   <span className="label">Intentos</span>
@@ -104,9 +105,11 @@ export function WithdrawalDetail({ id, operatorId, onClose }: Props) {
               // unlike the array index.
               <div className="history-item" key={`${h.occurredAt}-${h.newStatus}`}>
                 <div>
-                  {h.previousStatus ? `${h.previousStatus} → ${h.newStatus}` : `Creado en ${h.newStatus}`}
+                  {h.previousStatus
+                    ? `${STATUS_LABELS[h.previousStatus]} → ${STATUS_LABELS[h.newStatus]}`
+                    : `Creado en ${STATUS_LABELS[h.newStatus]}`}
                   {' · '}
-                  <strong>{h.actor}</strong>
+                  <strong>{actorLabel(h.actor)}</strong>
                 </div>
                 <div className="when">{formatDate(h.occurredAt)}</div>
               </div>
@@ -151,7 +154,7 @@ export function WithdrawalDetail({ id, operatorId, onClose }: Props) {
               )}
             </div>
             {noOperator && (withdrawal.status === 'PENDING_AUTHORIZATION' || withdrawal.status === 'RETRYABLE_ERROR' || withdrawal.status === 'MANUAL_REVIEW') && (
-              <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>Ingresá tu operator id arriba para poder actuar sobre este retiro.</p>
+              <p style={{ color: 'var(--text-dim)', fontSize: 12 }}>Ingresá tu ID de operador arriba para poder actuar sobre este retiro.</p>
             )}
           </>
         )}

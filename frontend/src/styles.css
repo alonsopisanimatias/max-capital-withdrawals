@@ -87,8 +87,17 @@ button {
 }
 
 .btn:disabled {
-  opacity: 0.4;
+  /* opacity alone wasn't a strong enough signal — a vivid blue/red pill at 40% opacity on a
+     dark background still reads as "colorful, so clickable" at a glance. grayscale removes the
+     color signal entirely regardless of which variant (.btn-primary/.btn-danger) it's paired
+     with, which is what actually reads as "disabled" instead of just "a bit faded". */
+  opacity: 0.5;
+  filter: grayscale(1);
   cursor: not-allowed;
+}
+
+.btn:disabled:hover {
+  opacity: 0.5;
 }
 
 .btn-primary {
@@ -153,6 +162,15 @@ td {
   border-bottom: 1px solid var(--panel-border);
   font-size: 13px;
   white-space: nowrap;
+}
+
+td {
+  /* Rows with an action button (a pill with its own padding) render visibly taller than
+     plain-text rows — 47px vs 42px, measured — which reads as the button being misaligned even
+     though it's centered within its own (taller) row: the row-height jump itself is the bug.
+     A fixed content-box height (browsers treat table-cell height as a floor, not a hard cap)
+     makes every row the same height, button or not. */
+  height: 27px;
 }
 
 th {
@@ -229,6 +247,7 @@ tbody tr:hover {
 
 .actions-cell {
   display: flex;
+  align-items: center;
   gap: 6px;
 }
 

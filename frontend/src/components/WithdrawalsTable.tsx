@@ -1,6 +1,7 @@
 import type { WithdrawalResponse } from '../api/types';
 import { StatusBadge } from './StatusBadge';
 import { useWithdrawalActions } from '../hooks/useWithdrawalActions';
+import { actorLabel, RISK_LABELS } from '../labels';
 
 interface Props {
   withdrawals: WithdrawalResponse[];
@@ -54,16 +55,16 @@ export function WithdrawalsTable({ withdrawals, operatorId, onSelect }: Props) {
               <td>
                 <StatusBadge status={w.status} />
               </td>
-              <td>{w.riskLevel ?? '—'}</td>
+              <td>{w.riskLevel ? RISK_LABELS[w.riskLevel] : '—'}</td>
               <td>{formatDate(w.createdAt)}</td>
-              <td>{w.updatedBy ?? '—'}</td>
+              <td>{w.updatedBy ? actorLabel(w.updatedBy) : '—'}</td>
               <td className="actions-cell">
                 {w.status === 'PENDING_AUTHORIZATION' && (
                   <>
                     <button
                       className="btn btn-small btn-primary"
                       disabled={noOperator || authorize.isPending}
-                      title={noOperator ? 'Ingresá tu operator id primero' : undefined}
+                      title={noOperator ? 'Ingresá tu ID de operador primero' : undefined}
                       onClick={(e) => run(authorize, w.id, e)}
                     >
                       Autorizar
@@ -71,7 +72,7 @@ export function WithdrawalsTable({ withdrawals, operatorId, onSelect }: Props) {
                     <button
                       className="btn btn-small btn-danger"
                       disabled={noOperator || reject.isPending}
-                      title={noOperator ? 'Ingresá tu operator id primero' : undefined}
+                      title={noOperator ? 'Ingresá tu ID de operador primero' : undefined}
                       onClick={(e) => run(reject, w.id, e)}
                     >
                       Rechazar
@@ -82,7 +83,7 @@ export function WithdrawalsTable({ withdrawals, operatorId, onSelect }: Props) {
                   <button
                     className="btn btn-small btn-primary"
                     disabled={noOperator || retry.isPending}
-                    title={noOperator ? 'Ingresá tu operator id primero' : undefined}
+                    title={noOperator ? 'Ingresá tu ID de operador primero' : undefined}
                     onClick={(e) => run(retry, w.id, e)}
                   >
                     Reintentar
@@ -92,7 +93,7 @@ export function WithdrawalsTable({ withdrawals, operatorId, onSelect }: Props) {
                   <button
                     className="btn btn-small btn-danger"
                     disabled={noOperator || resolveManualReview.isPending}
-                    title={noOperator ? 'Ingresá tu operator id primero' : undefined}
+                    title={noOperator ? 'Ingresá tu ID de operador primero' : 'Resolver revisión manual'}
                     onClick={(e) => run(resolveManualReview, w.id, e)}
                   >
                     Resolver

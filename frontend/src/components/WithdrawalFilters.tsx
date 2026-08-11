@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { WithdrawalFilters, WithdrawalStatus } from '../api/types';
+import { STATUS_LABELS } from '../labels';
 
 const SEARCH_DEBOUNCE_MS = 400;
 
@@ -50,7 +51,7 @@ export function WithdrawalFiltersBar({ filters, onChange }: Props) {
           <option value="">Todos</option>
           {STATUS_OPTIONS.map((status) => (
             <option key={status} value={status}>
-              {status}
+              {STATUS_LABELS[status]}
             </option>
           ))}
         </select>

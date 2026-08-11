@@ -2,6 +2,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { withdrawalsApi, type CreateWithdrawalRequest } from '../api/withdrawals';
 import { ApiError } from '../api/client';
 import { useToasts } from './useToasts';
+import { actorLabel, STATUS_LABELS } from '../labels';
 
 type Action = (id: string, operatorId: string) => Promise<unknown>;
 
@@ -25,8 +26,8 @@ function useAction(action: Action, successMessage: string) {
         const conflict = error.conflict;
         notify(
           'error',
-          conflict
-            ? `No se pudo aplicar: el retiro ya está en ${conflict.currentStatus} (actualizado por ${conflict.updatedBy ?? 'otro operador'}).`
+          conflict && conflict.currentStatus
+            ? `No se pudo aplicar: el retiro ya está en ${STATUS_LABELS[conflict.currentStatus]} (actualizado por ${conflict.updatedBy ? actorLabel(conflict.updatedBy) : 'otro operador'}).`
             : 'El retiro fue modificado por otra persona mientras tanto.',
         );
         queryClient.invalidateQueries({ queryKey: ['withdrawals'] });

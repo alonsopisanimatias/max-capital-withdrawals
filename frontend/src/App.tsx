@@ -20,10 +20,10 @@ export function App() {
   return (
     <>
       <div className="topbar">
-        <h1>Withdrawals Backoffice</h1>
+        <h1>Backoffice de Retiros</h1>
         <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
           <label className="operator-field">
-            Operator ID
+            ID de operador
             <input
               type="text"
               value={operatorId}
