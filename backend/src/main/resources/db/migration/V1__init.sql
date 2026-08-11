@@ -1,6 +1,6 @@
 -- no optimistic-locking version column: concurrent writes go through the conditional
 -- atomic UPDATEs in AccountRepository (C5), which Postgres already serializes at the row
--- level — an unused @Version here would just be dead weight, see PLAN_TECNICO_FINAL.md.
+-- level — an unused @Version here would just be dead weight, see DECISIONS.md section 7.
 create table account (
     id               uuid primary key,
     account_number   varchar(20) not null unique,

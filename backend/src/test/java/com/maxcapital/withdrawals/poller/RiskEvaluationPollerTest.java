@@ -17,6 +17,7 @@ import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -62,9 +63,7 @@ class RiskEvaluationPollerTest extends AbstractIntegrationTest {
         testRiskService.forAccount(accountId, RiskLevel.LOW);
         Withdrawal withdrawal = withdrawalService.createWithdrawal(accountId, CBU, new BigDecimal("100.00"));
 
-        poller.processBatch();
-
-        Withdrawal reloaded = withdrawalRepository.findById(withdrawal.getId()).orElseThrow();
+        Withdrawal reloaded = waitUntilEvaluated(withdrawal.getId());
         assertThat(reloaded.getStatus()).isEqualTo(WithdrawalStatus.AUTHORIZED);
         assertThat(reloaded.getRiskLevel()).isEqualTo(RiskLevel.LOW);
         assertThat(reloaded.getRiskEvaluatedAt()).isNotNull();
@@ -77,9 +76,7 @@ class RiskEvaluationPollerTest extends AbstractIntegrationTest {
         testRiskService.forAccount(accountId, RiskLevel.HIGH);
         Withdrawal withdrawal = withdrawalService.createWithdrawal(accountId, CBU, new BigDecimal("100.00"));
 
-        poller.processBatch();
-
-        Withdrawal reloaded = withdrawalRepository.findById(withdrawal.getId()).orElseThrow();
+        Withdrawal reloaded = waitUntilEvaluated(withdrawal.getId());
         assertThat(reloaded.getStatus()).isEqualTo(WithdrawalStatus.PENDING_AUTHORIZATION);
         assertThat(reloaded.getRiskLevel()).isEqualTo(RiskLevel.HIGH);
     }
@@ -90,11 +87,46 @@ class RiskEvaluationPollerTest extends AbstractIntegrationTest {
         testRiskService.forAccountFails(accountId);
         Withdrawal withdrawal = withdrawalService.createWithdrawal(accountId, CBU, new BigDecimal("100.00"));
 
-        poller.processBatch();
-
-        Withdrawal reloaded = withdrawalRepository.findById(withdrawal.getId()).orElseThrow();
+        Withdrawal reloaded = waitUntilEvaluated(withdrawal.getId());
         assertThat(reloaded.getStatus()).isEqualTo(WithdrawalStatus.PENDING_AUTHORIZATION);
         assertThat(reloaded.getRiskLevel()).isNull(); // never resolved — the point of the fail-safe
+    }
+
+    /**
+     * Retries processBatch() instead of assuming one call suffices — other test classes share
+     * this same Postgres instance and can leave older EVALUATING_RISK withdrawals ahead of this
+     * one in the claim batch (LIMIT batchSize, oldest first).
+     */
+    private Withdrawal waitUntilEvaluated(UUID withdrawalId) {
+        return waitUntilEvaluated(withdrawalId, poller::processBatch);
+    }
+
+    private Withdrawal waitUntilEvaluated(UUID withdrawalId, Runnable tick) {
+        long deadline = System.currentTimeMillis() + java.time.Duration.ofSeconds(20).toMillis();
+        Withdrawal reloaded;
+        do {
+            tick.run();
+            reloaded = withdrawalRepository.findById(withdrawalId).orElseThrow();
+        } while (reloaded.getStatus() == WithdrawalStatus.EVALUATING_RISK && System.currentTimeMillis() < deadline);
+        return reloaded;
+    }
+
+    /**
+     * Regression guard for the self-invocation pitfall documented on {@link RiskEvaluationPoller#tick()}:
+     * every other test here drives processBatch() directly, which never touches tick() at all —
+     * if `self.processBatch()` inside tick() silently regressed back to `this.processBatch()`
+     * (skipping the Spring proxy and dropping @Transactional(REQUIRES_NEW)), none of them would
+     * notice. This one goes through the real @Scheduled entry point instead.
+     */
+    @Test
+    void tickGoesThroughTheProxyAndStillEvaluatesRisk() throws Exception {
+        UUID accountId = seedAccount();
+        testRiskService.forAccount(accountId, RiskLevel.LOW);
+        Withdrawal withdrawal = withdrawalService.createWithdrawal(accountId, CBU, new BigDecimal("100.00"));
+
+        Withdrawal reloaded = waitUntilEvaluated(withdrawal.getId(), poller::tick);
+        assertThat(reloaded.getStatus()).isEqualTo(WithdrawalStatus.AUTHORIZED);
+        assertThat(reloaded.getRiskLevel()).isEqualTo(RiskLevel.LOW);
     }
 
     @Test
@@ -110,10 +142,18 @@ class RiskEvaluationPollerTest extends AbstractIntegrationTest {
 
         // simulates 2 backend instances polling concurrently (C3)
         int pollersSimulated = 2;
-        int ticksPerPoller = 5; // enough to drain 12 rows in batches of 5
+        // generous headroom: other test classes sharing this Postgres instance may leave their
+        // own EVALUATING_RISK stragglers ahead of these 12 in the claim order
+        int ticksPerPoller = 15;
         ExecutorService executor = Executors.newFixedThreadPool(pollersSimulated);
         CountDownLatch start = new CountDownLatch(1);
         CountDownLatch done = new CountDownLatch(pollersSimulated);
+        // surfaced explicitly instead of swallowed: submit()'s Future absorbs any exception
+        // thrown inside the task silently unless something calls get() on it — without this,
+        // a real bug in processBatch() would just make the assertions below fail confusingly
+        // (or not at all) instead of showing the actual exception. Same pattern as
+        // AccountReservationConcurrencyTest, the project's other concurrency test.
+        ConcurrentLinkedQueue<Throwable> unexpectedFailures = new ConcurrentLinkedQueue<>();
 
         for (int i = 0; i < pollersSimulated; i++) {
             executor.submit(() -> {
@@ -124,6 +164,8 @@ class RiskEvaluationPollerTest extends AbstractIntegrationTest {
                     }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                } catch (Throwable t) {
+                    unexpectedFailures.add(t);
                 } finally {
                     done.countDown();
                 }
@@ -132,6 +174,8 @@ class RiskEvaluationPollerTest extends AbstractIntegrationTest {
         start.countDown();
         assertThat(done.await(30, TimeUnit.SECONDS)).as("both pollers should finish within 30s").isTrue();
         executor.shutdown();
+
+        assertThat(unexpectedFailures).as("no poller thread should throw").isEmpty();
 
         for (UUID accountId : accountIds) {
             assertThat(testRiskService.invocationCount(accountId))

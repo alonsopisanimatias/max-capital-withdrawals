@@ -57,12 +57,23 @@ class WithdrawalServiceAuthorizationTest extends AbstractIntegrationTest {
         return account.getId();
     }
 
-    /** Drives a fresh withdrawal to PENDING_AUTHORIZATION the same way production does: via HIGH risk. */
+    /**
+     * Drives a fresh withdrawal to PENDING_AUTHORIZATION the same way production does: via HIGH
+     * risk. Retries processBatch() instead of assuming one call suffices — other test classes
+     * share this same Postgres instance and can leave older EVALUATING_RISK withdrawals ahead
+     * of this one in the claim batch (LIMIT batchSize, oldest first).
+     */
     private Withdrawal createPendingAuthorization(UUID accountId) throws Exception {
         testRiskService.forAccount(accountId, RiskLevel.HIGH);
         Withdrawal withdrawal = withdrawalService.createWithdrawal(accountId, CBU, new BigDecimal("500.00"));
-        riskEvaluationPoller.processBatch();
-        Withdrawal reloaded = withdrawalRepository.findById(withdrawal.getId()).orElseThrow();
+
+        long deadline = System.currentTimeMillis() + java.time.Duration.ofSeconds(20).toMillis();
+        Withdrawal reloaded;
+        do {
+            riskEvaluationPoller.processBatch();
+            reloaded = withdrawalRepository.findById(withdrawal.getId()).orElseThrow();
+        } while (reloaded.getStatus() == WithdrawalStatus.EVALUATING_RISK && System.currentTimeMillis() < deadline);
+
         assertThat(reloaded.getStatus()).isEqualTo(WithdrawalStatus.PENDING_AUTHORIZATION);
         return reloaded;
     }

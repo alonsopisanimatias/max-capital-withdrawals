@@ -40,7 +40,7 @@ public interface AccountRepository extends JpaRepository<Account, UUID> {
      * withdrawal ends in REJECTED or FINAL_ERROR. Guarded by {@code reserved_balance >= :amount}
      * so a duplicate release (e.g. reconciliation running twice) can never drive it negative;
      * callers must also gate this behind a conditional status-transition UPDATE on withdrawal
-     * so the effect is applied at most once (see PLAN_TECNICO_FINAL.md fix #2).
+     * so the effect is applied at most once (see DECISIONS.md section 8, C6).
      */
     @Modifying
     @Transactional

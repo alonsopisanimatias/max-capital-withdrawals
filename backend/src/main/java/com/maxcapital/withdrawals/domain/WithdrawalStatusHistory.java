@@ -15,7 +15,7 @@ import java.util.UUID;
 /**
  * Append-only audit trail — not required by the challenge statement, added because a
  * CNV-regulated broker would expect to reconstruct the full sequence of decisions on a
- * withdrawal, not just the last actor (see PLAN_TECNICO_FINAL.md).
+ * withdrawal, not just the last actor (see DECISIONS.md, section 2.4).
  */
 @Entity
 @Table(name = "withdrawal_status_history")

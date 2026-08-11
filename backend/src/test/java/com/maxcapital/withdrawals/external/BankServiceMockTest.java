@@ -1,7 +1,12 @@
 package com.maxcapital.withdrawals.external;
 
+import com.maxcapital.withdrawals.AbstractIntegrationTest;
+import com.maxcapital.withdrawals.external.mock.BankMockInFlightRepository;
+import com.maxcapital.withdrawals.external.mock.BankMockLedgerRepository;
 import com.maxcapital.withdrawals.external.mock.BankServiceMock;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.math.BigDecimal;
 import java.util.UUID;
@@ -15,12 +20,28 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  * random-outcome distribution or the realistic latency, which would make this slow and
  * flaky. The random path is exercised indirectly by the poller-level concurrency tests
  * in later blocks, using {@link com.maxcapital.withdrawals.external.mock.TestBankService}.
+ *
+ * <p>Runs against real Postgres (extends {@link AbstractIntegrationTest}) because
+ * {@link BankServiceMock}'s ground truth now lives in {@code bank_mock_ledger} /
+ * {@code bank_mock_in_flight} (see its javadoc for why), not in an in-process map — there's no
+ * pure-Java version of this logic left to unit-test in isolation anymore.
  */
-class BankServiceMockTest {
+class BankServiceMockTest extends AbstractIntegrationTest {
+
+    @Autowired
+    private BankMockLedgerRepository ledgerRepository;
+
+    @Autowired
+    private BankMockInFlightRepository inFlightRepository;
 
     // near-zero latency: exercises the exact same forcing/caching logic as the production
     // mock (3-10s) without paying the real delay in the test suite.
-    private final BankServiceMock bankService = new BankServiceMock(0, 5);
+    private BankServiceMock bankService;
+
+    @BeforeEach
+    void setUp() {
+        bankService = new BankServiceMock(ledgerRepository, inFlightRepository, 0, 5);
+    }
 
     @Test
     void forcedInternalErrorIsNeverCached_soARetryCanSucceed() throws Exception {

@@ -17,7 +17,7 @@ spring:
     password: ${DB_PASSWORD:withdrawals}
     hikari:
       # sized to cover the 3 poller threads + reconciliation + normal HTTP traffic,
-      # see PLAN_TECNICO_FINAL.md fix #1 (scheduling pool bottleneck)
+      # see DECISIONS.md section 3 (scheduling/executor pool sizing)
       maximum-pool-size: 15
       minimum-idle: 5
 
@@ -29,7 +29,7 @@ spring:
     scheduling:
       pool:
         # default is 1, which serializes the 3 @Scheduled pollers on a single thread;
-        # see PLAN_TECNICO_FINAL.md fix #1
+        # see DECISIONS.md section 3
         size: 4
 
 server:

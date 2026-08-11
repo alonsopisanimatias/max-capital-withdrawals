@@ -49,6 +49,8 @@ public class TestBankService implements BankService {
     private final Map<UUID, StoredOutcome> store = new ConcurrentHashMap<>();
     private final Set<UUID> inFlight = ConcurrentHashMap.newKeySet();
     private final Map<UUID, AtomicInteger> executionCounts = new ConcurrentHashMap<>();
+    private final Map<UUID, AtomicInteger> queryCounts = new ConcurrentHashMap<>();
+    private final Set<UUID> failingQueries = ConcurrentHashMap.newKeySet();
 
     @Override
     public BankTransferResult executeTransfer(UUID idempotencyKey, UUID accountId, String destinationCbu, BigDecimal amount)
@@ -92,6 +94,10 @@ public class TestBankService implements BankService {
 
     @Override
     public BankQueryResult queryByIdempotencyKey(UUID idempotencyKey) {
+        queryCounts.computeIfAbsent(idempotencyKey, k -> new AtomicInteger()).incrementAndGet();
+        if (failingQueries.contains(idempotencyKey)) {
+            throw new RuntimeException("Programmed reconciliation lookup failure for " + idempotencyKey);
+        }
         StoredOutcome stored = store.get(idempotencyKey);
         if (stored == null) {
             return BankQueryResult.notFound();
@@ -130,6 +136,16 @@ public class TestBankService implements BankService {
         return executionCounts.getOrDefault(idempotencyKey, new AtomicInteger()).get();
     }
 
+    public int queryCount(UUID idempotencyKey) {
+        return queryCounts.getOrDefault(idempotencyKey, new AtomicInteger()).get();
+    }
+
+    /** Makes every queryByIdempotencyKey call for this key throw, simulating a reconciliation
+     *  lookup that keeps failing (e.g. bank query endpoint down) until MANUAL_REVIEW kicks in. */
+    public void failQueriesFor(UUID idempotencyKey) {
+        failingQueries.add(idempotencyKey);
+    }
+
     private String generateBankReference() {
         return "BANK-TEST-" + UUID.randomUUID();
     }
@@ -139,5 +155,7 @@ public class TestBankService implements BankService {
         store.clear();
         inFlight.clear();
         executionCounts.clear();
+        queryCounts.clear();
+        failingQueries.clear();
     }
 }

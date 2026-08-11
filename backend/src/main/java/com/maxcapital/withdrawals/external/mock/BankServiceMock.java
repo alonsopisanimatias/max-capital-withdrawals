@@ -7,14 +7,13 @@ import com.maxcapital.withdrawals.external.BankTransferResult;
 import com.maxcapital.withdrawals.external.IdempotentRequestInProgressException;
 import com.maxcapital.withdrawals.external.InternalErrorException;
 import com.maxcapital.withdrawals.external.InvalidAccountException;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
-import java.util.Map;
-import java.util.Set;
+import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
@@ -23,6 +22,15 @@ import java.util.concurrent.ThreadLocalRandom;
  * digits: .13 -> InternalErrorException, .14 -> timeout where the transfer DID apply on
  * the bank's side, .15 -> timeout where it did NOT apply, .16 -> InvalidAccountException,
  * .50 -> guaranteed success (useful to deterministically retry after a forced failure).
+ *
+ * <p>Ground truth is persisted in {@code bank_mock_ledger} / {@code bank_mock_in_flight}
+ * (via {@link BankMockLedgerRepository} / {@link BankMockInFlightRepository}), not held in an
+ * in-process map. A real bank has exactly one ground truth regardless of who's asking; an
+ * in-memory map gave this mock a different one PER BACKEND INSTANCE. Under the docker-compose
+ * C3 demo (2+ instances), instance A could cache an outcome in its own heap that instance B's
+ * reconciliation — landing on a different JVM entirely — would never see, and would then
+ * misread as NOT_FOUND. Persisting it is what makes {@link #queryByIdempotencyKey} actually
+ * answer for "the bank" instead of for "whichever instance happened to call executeTransfer".
  *
  * <p>Caching semantics per idempotency key (this is the part that makes C6 testable):
  * <ul>
@@ -36,7 +44,9 @@ import java.util.concurrent.ThreadLocalRandom;
  *       the only thing allowed to resolve it — {@code executeTransfer} never re-decides an
  *       ambiguous timeout on its own.</li>
  *   <li>A second call while the first is still in flight throws
- *       {@link IdempotentRequestInProgressException} instead of running twice concurrently.</li>
+ *       {@link IdempotentRequestInProgressException} instead of running twice concurrently —
+ *       enforced by {@link BankMockInFlightRepository#tryClaim}'s primary-key uniqueness, so
+ *       it holds across instances too, not just within one JVM.</li>
  * </ul>
  * Automated tests use {@link TestBankService} instead — see its profile.
  */
@@ -44,29 +54,21 @@ import java.util.concurrent.ThreadLocalRandom;
 @Profile("!test")
 public class BankServiceMock implements BankService {
 
-    private sealed interface StoredOutcome permits Applied, RejectedInvalidAccount, TimeoutGroundTruth {
-    }
-
-    private record Applied(String bankReference) implements StoredOutcome {
-    }
-
-    private record RejectedInvalidAccount() implements StoredOutcome {
-    }
-
-    private record TimeoutGroundTruth(boolean applied, String bankReferenceIfApplied) implements StoredOutcome {
-    }
-
-    private final Map<UUID, StoredOutcome> store = new ConcurrentHashMap<>();
-    private final Set<UUID> inFlight = ConcurrentHashMap.newKeySet();
+    private final BankMockLedgerRepository ledgerRepository;
+    private final BankMockInFlightRepository inFlightRepository;
     private final int minLatencyMs;
     private final int maxLatencyMs;
 
-    public BankServiceMock() {
-        this(3000, 10000);
+    @Autowired
+    public BankServiceMock(BankMockLedgerRepository ledgerRepository, BankMockInFlightRepository inFlightRepository) {
+        this(ledgerRepository, inFlightRepository, 3000, 10000);
     }
 
     /** For tests that need to exercise the real forcing/caching logic without paying the realistic delay. */
-    public BankServiceMock(int minLatencyMs, int maxLatencyMs) {
+    public BankServiceMock(BankMockLedgerRepository ledgerRepository, BankMockInFlightRepository inFlightRepository,
+                            int minLatencyMs, int maxLatencyMs) {
+        this.ledgerRepository = ledgerRepository;
+        this.inFlightRepository = inFlightRepository;
         this.minLatencyMs = minLatencyMs;
         this.maxLatencyMs = maxLatencyMs;
     }
@@ -80,54 +82,52 @@ public class BankServiceMock implements BankService {
             return replay;
         }
 
-        if (!inFlight.add(idempotencyKey)) {
+        if (inFlightRepository.tryClaim(idempotencyKey) == 0) {
             throw new IdempotentRequestInProgressException("A transfer for this idempotency key is already in flight: " + idempotencyKey);
         }
         try {
             int forcingDigits = forcingDigits(amount);
             simulateLatency();
-            resolveOutcome(idempotencyKey, forcingDigits);
-            // resolveOutcome always either returns normally after storing Applied, or throws
-            StoredOutcome stored = store.get(idempotencyKey);
-            return new BankTransferResult(((Applied) stored).bankReference());
+            return resolveOutcome(idempotencyKey, forcingDigits);
         } finally {
-            inFlight.remove(idempotencyKey);
+            inFlightRepository.release(idempotencyKey);
         }
     }
 
     @Override
     public BankQueryResult queryByIdempotencyKey(UUID idempotencyKey) {
-        StoredOutcome stored = store.get(idempotencyKey);
-        if (stored == null) {
-            return BankQueryResult.notFound();
-        }
-        return switch (stored) {
-            case Applied a -> new BankQueryResult(BankQueryResult.Outcome.APPLIED, a.bankReference());
-            case RejectedInvalidAccount ignored -> new BankQueryResult(BankQueryResult.Outcome.FAILED_INVALID_ACCOUNT, null);
-            case TimeoutGroundTruth t when t.applied() -> new BankQueryResult(BankQueryResult.Outcome.APPLIED, t.bankReferenceIfApplied());
-            case TimeoutGroundTruth ignored -> BankQueryResult.notFound(); // never really applied: safe to retry, same as no record
+        return ledgerRepository.findById(idempotencyKey)
+                .map(BankServiceMock::toQueryResult)
+                .orElseGet(BankQueryResult::notFound);
+    }
+
+    private static BankQueryResult toQueryResult(BankMockLedgerEntry entry) {
+        return switch (entry.getOutcome()) {
+            case APPLIED, TIMEOUT_APPLIED_TRUE -> new BankQueryResult(BankQueryResult.Outcome.APPLIED, entry.getBankReference());
+            case REJECTED_INVALID_ACCOUNT -> new BankQueryResult(BankQueryResult.Outcome.FAILED_INVALID_ACCOUNT, null);
+            case TIMEOUT_APPLIED_FALSE -> BankQueryResult.notFound(); // never really applied: safe to retry, same as no record
         };
     }
 
     /** Terminal outcomes (and applied timeouts) replay without re-executing; returns null if a fresh attempt is needed. */
     private BankTransferResult tryReplayTerminalOutcome(UUID idempotencyKey) throws InvalidAccountException {
-        StoredOutcome stored = store.get(idempotencyKey);
-        if (stored == null) {
+        Optional<BankMockLedgerEntry> existing = ledgerRepository.findById(idempotencyKey);
+        if (existing.isEmpty()) {
             return null;
         }
-        return switch (stored) {
-            case Applied a -> new BankTransferResult(a.bankReference());
-            case RejectedInvalidAccount ignored -> throw new InvalidAccountException("Cached: destination account is invalid");
-            case TimeoutGroundTruth t when t.applied() -> new BankTransferResult(t.bankReferenceIfApplied());
-            case TimeoutGroundTruth ignored -> {
+        BankMockLedgerEntry entry = existing.get();
+        return switch (entry.getOutcome()) {
+            case APPLIED, TIMEOUT_APPLIED_TRUE -> new BankTransferResult(entry.getBankReference());
+            case REJECTED_INVALID_ACCOUNT -> throw new InvalidAccountException("Cached: destination account is invalid");
+            case TIMEOUT_APPLIED_FALSE -> {
                 // never really applied: treat as if there was no prior attempt, allow a fresh one
-                store.remove(idempotencyKey);
+                ledgerRepository.deleteById(idempotencyKey);
                 yield null;
             }
         };
     }
 
-    private void resolveOutcome(UUID idempotencyKey, int forcingDigits)
+    private BankTransferResult resolveOutcome(UUID idempotencyKey, int forcingDigits)
             throws InvalidAccountException, InternalErrorException, BankTimeoutException {
         switch (forcingDigits) {
             case 13 -> throw new InternalErrorException("Forced internal error via amount convention (.13)");
@@ -140,15 +140,19 @@ public class BankServiceMock implements BankService {
                 throw new BankTimeoutException("Forced timeout, applied=false via amount convention (.15)");
             }
             case 16 -> {
-                store.put(idempotencyKey, new RejectedInvalidAccount());
+                ledgerRepository.save(new BankMockLedgerEntry(idempotencyKey, BankMockLedgerEntry.Outcome.REJECTED_INVALID_ACCOUNT, null));
                 throw new InvalidAccountException("Forced invalid account via amount convention (.16)");
             }
-            case 50 -> store.put(idempotencyKey, new Applied(generateBankReference()));
-            default -> resolveRandomOutcome(idempotencyKey);
+            case 50 -> {
+                return storeApplied(idempotencyKey);
+            }
+            default -> {
+                return resolveRandomOutcome(idempotencyKey);
+            }
         }
     }
 
-    private void resolveRandomOutcome(UUID idempotencyKey) throws InvalidAccountException, InternalErrorException, BankTimeoutException {
+    private BankTransferResult resolveRandomOutcome(UUID idempotencyKey) throws InvalidAccountException, InternalErrorException, BankTimeoutException {
         double roll = ThreadLocalRandom.current().nextDouble();
         if (roll < 0.05) {
             throw new InternalErrorException("Bank internal error");
@@ -157,15 +161,24 @@ public class BankServiceMock implements BankService {
             storeTimeoutGroundTruth(idempotencyKey, applied);
             throw new BankTimeoutException("Bank did not respond in time");
         } else if (roll < 0.10) {
-            store.put(idempotencyKey, new RejectedInvalidAccount());
+            ledgerRepository.save(new BankMockLedgerEntry(idempotencyKey, BankMockLedgerEntry.Outcome.REJECTED_INVALID_ACCOUNT, null));
             throw new InvalidAccountException("Destination account is invalid");
         }
-        store.put(idempotencyKey, new Applied(generateBankReference()));
+        return storeApplied(idempotencyKey);
+    }
+
+    private BankTransferResult storeApplied(UUID idempotencyKey) {
+        String reference = generateBankReference();
+        ledgerRepository.save(new BankMockLedgerEntry(idempotencyKey, BankMockLedgerEntry.Outcome.APPLIED, reference));
+        return new BankTransferResult(reference);
     }
 
     private void storeTimeoutGroundTruth(UUID idempotencyKey, boolean applied) {
+        BankMockLedgerEntry.Outcome outcome = applied
+                ? BankMockLedgerEntry.Outcome.TIMEOUT_APPLIED_TRUE
+                : BankMockLedgerEntry.Outcome.TIMEOUT_APPLIED_FALSE;
         String reference = applied ? generateBankReference() : null;
-        store.put(idempotencyKey, new TimeoutGroundTruth(applied, reference));
+        ledgerRepository.save(new BankMockLedgerEntry(idempotencyKey, outcome, reference));
     }
 
     private String generateBankReference() {

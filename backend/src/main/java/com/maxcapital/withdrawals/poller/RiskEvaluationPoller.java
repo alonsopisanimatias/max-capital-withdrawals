@@ -9,6 +9,7 @@ import com.maxcapital.withdrawals.external.RiskService;
 import com.maxcapital.withdrawals.repository.WithdrawalRepository;
 import com.maxcapital.withdrawals.repository.WithdrawalStatusHistoryRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Lazy;
@@ -27,7 +28,7 @@ import java.util.UUID;
  *
  * <p>The claim (SKIP LOCKED) and the resulting status write happen in the SAME transaction,
  * so the row stays locked for the full ~1-3s risk call — a deliberate trade-off documented in
- * PLAN_TECNICO_FINAL.md: bounded batch size keeps this defensible without needing the two-phase
+ * DECISIONS.md section 4: bounded batch size keeps this defensible without needing the two-phase
  * split the transfer poller uses (that split exists for C6's timeout ambiguity, which risk
  * evaluation doesn't have — it's a read-only check with no external side effect to reconcile).
  *
@@ -37,6 +38,7 @@ import java.util.UUID;
  */
 @Component
 @RequiredArgsConstructor
+@Slf4j
 public class RiskEvaluationPoller {
 
     private static final String ACTOR_SYSTEM_RISK = "SYSTEM_RISK";
@@ -47,6 +49,10 @@ public class RiskEvaluationPoller {
 
     @Value("${withdrawals.poller.risk-evaluation.batch-size}")
     private int batchSize;
+
+    // logging only — lets the multi-instance demo show each container claiming disjoint rows
+    @Value("${instance.id}")
+    private String instanceId;
 
     // self-injection through the Spring proxy: calling processBatch() as `this.processBatch()`
     // (plain self-invocation) would bypass the AOP proxy entirely, silently dropping the
@@ -66,6 +72,10 @@ public class RiskEvaluationPoller {
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void processBatch() {
         List<Withdrawal> claimed = withdrawalRepository.lockNextBatchForRiskEvaluation(batchSize);
+        if (!claimed.isEmpty()) {
+            log.info("[{}] risk evaluation claimed {} withdrawal(s): {}", instanceId, claimed.size(),
+                    claimed.stream().map(Withdrawal::getId).toList());
+        }
         for (Withdrawal withdrawal : claimed) {
             evaluateOne(withdrawal);
         }

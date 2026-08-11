@@ -27,7 +27,7 @@ public class Account {
 
     // read-only view for callers: mutations to balance/reserved_balance go through
     // the atomic conditional UPDATEs in AccountRepository, never through this entity's setters
-    // (see PLAN_TECNICO_FINAL.md fixes #2 and #6 — this field is not the source of truth for writes).
+    // (see DECISIONS.md sections 7 and 8 — this field is not the source of truth for writes).
     @Column(name = "balance", nullable = false)
     private BigDecimal balance;
 

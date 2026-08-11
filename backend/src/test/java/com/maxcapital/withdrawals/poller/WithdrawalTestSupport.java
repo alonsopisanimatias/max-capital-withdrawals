@@ -60,14 +60,15 @@ abstract class WithdrawalTestSupport extends AbstractIntegrationTest {
         return account.getId();
     }
 
-    /** Drives a fresh withdrawal all the way to AUTHORIZED via a real (forced LOW) risk evaluation. */
+    /**
+     * Drives a fresh withdrawal all the way to AUTHORIZED via a real (forced LOW) risk
+     * evaluation. Retries processBatch() rather than assuming one call suffices — see
+     * {@link #waitUntilStatus(UUID, WithdrawalStatus, Duration, Runnable)} for why.
+     */
     protected Withdrawal createAuthorizedWithdrawal(UUID accountId, BigDecimal amount) throws Exception {
         testRiskService.forAccount(accountId, RiskLevel.LOW);
         Withdrawal withdrawal = withdrawalService.createWithdrawal(accountId, CBU, amount);
-        riskEvaluationPoller.processBatch();
-        Withdrawal reloaded = withdrawalRepository.findById(withdrawal.getId()).orElseThrow();
-        assertThat(reloaded.getStatus()).isEqualTo(WithdrawalStatus.AUTHORIZED);
-        return reloaded;
+        return waitUntilStatus(withdrawal.getId(), WithdrawalStatus.AUTHORIZED, Duration.ofSeconds(20), riskEvaluationPoller::processBatch);
     }
 
     /** Phase B/C run asynchronously on the transfer executor — poll instead of asserting immediately. */

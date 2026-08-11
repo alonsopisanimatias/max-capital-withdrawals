@@ -2,6 +2,7 @@ package com.maxcapital.withdrawals.repository;
 
 import com.maxcapital.withdrawals.domain.Withdrawal;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -10,7 +11,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.util.List;
 import java.util.UUID;
 
-public interface WithdrawalRepository extends JpaRepository<Withdrawal, UUID> {
+public interface WithdrawalRepository extends JpaRepository<Withdrawal, UUID>, JpaSpecificationExecutor<Withdrawal> {
 
     /**
      * Claims up to {@code batchSize} withdrawals still awaiting risk evaluation, oldest first.
@@ -46,7 +47,7 @@ public interface WithdrawalRepository extends JpaRepository<Withdrawal, UUID> {
      * between claiming the withdrawal and actually calling the bank. Locks the WITHDRAWAL row,
      * not transfer, deliberately: the transfer poller also locks withdrawal, so both pollers
      * share one critical section per aggregate instead of two independent locking schemes that
-     * could race with each other (see PLAN_TECNICO_FINAL.md fix #3). {@code FOR UPDATE OF w}
+     * could race with each other (see DECISIONS.md section 8, C6). {@code FOR UPDATE OF w}
      * restricts the lock to the withdrawal rows even though transfer is joined for the filter.
      */
     @Query(value = """
@@ -62,11 +63,17 @@ public interface WithdrawalRepository extends JpaRepository<Withdrawal, UUID> {
 
     /**
      * The C6 guard: only actually applies an outcome (settle balance, mark FINAL_ERROR, etc.)
-     * if the withdrawal is still PROCESSING_TRANSFER. If a late-arriving phase B result races
-     * with reconciliation already having resolved the same withdrawal, whichever writer gets
-     * here second affects 0 rows and must skip every side effect (balance change, transfer
-     * update) rather than double-apply them. {@code transferId} is only meaningful for the
-     * EXECUTED outcome; COALESCE leaves it untouched (still null) for every other transition.
+     * if the withdrawal is still PROCESSING_TRANSFER <b>for the same attempt</b> the caller
+     * started with. Status alone isn't enough to discriminate: if attempt 1 times out and
+     * reconciliation resets the withdrawal to AUTHORIZED (still consulting the same
+     * `transfer` row, but now on attempt 2), the withdrawal moves back to PROCESSING_TRANSFER
+     * for attempt 2 — a late result from attempt 1 arriving after that would still see
+     * status = PROCESSING_TRANSFER and pass a status-only guard, applying attempt 1's outcome
+     * on top of attempt 2's in-flight work. Joining {@code transfer.attempt_count} against the
+     * value the caller captured before calling the bank closes that window: a stale attempt's
+     * result now affects 0 rows, same as an already-resolved withdrawal does.
+     * {@code transferId} is only meaningful for the EXECUTED outcome; COALESCE leaves it
+     * untouched (still null) for every other transition.
      */
     @Modifying
     @Transactional
@@ -76,8 +83,11 @@ public interface WithdrawalRepository extends JpaRepository<Withdrawal, UUID> {
                 updated_at = now(),
                 updated_by = :actor,
                 transfer_id = COALESCE(:transferId, transfer_id)
-            WHERE id = :id AND status = 'PROCESSING_TRANSFER'
+            WHERE id = :id
+              AND status = 'PROCESSING_TRANSFER'
+              AND (SELECT t.attempt_count FROM transfer t WHERE t.withdrawal_id = :id) = :expectedAttemptCount
             """, nativeQuery = true)
     int transitionFromProcessingTransfer(@Param("id") UUID id, @Param("newStatus") String newStatus,
-                                          @Param("actor") String actor, @Param("transferId") UUID transferId);
+                                          @Param("actor") String actor, @Param("transferId") UUID transferId,
+                                          @Param("expectedAttemptCount") int expectedAttemptCount);
 }

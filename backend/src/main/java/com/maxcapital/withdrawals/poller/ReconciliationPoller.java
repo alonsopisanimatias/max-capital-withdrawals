@@ -17,7 +17,6 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -44,6 +43,10 @@ public class ReconciliationPoller {
     @Value("${withdrawals.poller.reconciliation.grace-period-seconds}")
     private int gracePeriodSeconds;
 
+    // logging only — lets the multi-instance demo show each container claiming disjoint rows
+    @Value("${instance.id}")
+    private String instanceId;
+
     // see RiskEvaluationPoller for why: self-invoking claimBatch() as a plain method call would
     // skip the Spring proxy and silently drop @Transactional(REQUIRES_NEW) on it.
     @Autowired
@@ -66,17 +69,21 @@ public class ReconciliationPoller {
      * gets for free by writing PROCESSING_TRANSFER in its own claim step; reconciliation has no
      * separate status to move to, so it reuses requested_at as that same kind of claim marker.
      * If the actual resolution below never completes, the row simply becomes eligible again
-     * after another full grace period — self-healing, not a stuck claim.
+     * after another full grace period — self-healing, not a stuck claim. Stamped via the
+     * database's own clock ({@link TransferRepository#markRequestedNow}), not the JVM's — see
+     * its javadoc for why that matters across 2+ instances.
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public List<UUID> claimBatch() {
         List<Withdrawal> claimed = withdrawalRepository.lockNextBatchForReconciliation(batchSize, gracePeriodSeconds);
+        if (!claimed.isEmpty()) {
+            log.info("[{}] reconciliation claimed {} withdrawal(s): {}", instanceId, claimed.size(),
+                    claimed.stream().map(Withdrawal::getId).toList());
+        }
         List<UUID> ids = new ArrayList<>();
         for (Withdrawal withdrawal : claimed) {
-            transferRepository.findByWithdrawalId(withdrawal.getId()).ifPresent(transfer -> {
-                transfer.setRequestedAt(Instant.now());
-                transferRepository.save(transfer);
-            });
+            transferRepository.findByWithdrawalId(withdrawal.getId())
+                    .ifPresent(transfer -> transferRepository.markRequestedNow(transfer.getId()));
             ids.add(withdrawal.getId());
         }
         return ids;
@@ -84,16 +91,19 @@ public class ReconciliationPoller {
 
     private void reconcileOne(UUID withdrawalId) {
         Transfer transfer = transferRepository.findByWithdrawalId(withdrawalId).orElseThrow();
+        // same attempt-scoping as the transfer poller: this resolution only applies to the
+        // attempt that was actually in flight when reconciliation looked it up
+        int attemptCount = transfer.getAttemptCount();
         try {
             BankQueryResult result = bankService.queryByIdempotencyKey(transfer.getIdempotencyKey());
             switch (result.outcome()) {
                 case APPLIED -> outcomeService.applySuccess(
-                        withdrawalId, transfer.getId(), result.bankReference(), TransferOutcomeService.ACTOR_SYSTEM_RECONCILIATION);
+                        withdrawalId, transfer.getId(), result.bankReference(), TransferOutcomeService.ACTOR_SYSTEM_RECONCILIATION, attemptCount);
                 case FAILED_INVALID_ACCOUNT -> outcomeService.applyInvalidAccount(
-                        withdrawalId, transfer.getId(), "Reconciliation: bank reports invalid account", TransferOutcomeService.ACTOR_SYSTEM_RECONCILIATION);
+                        withdrawalId, transfer.getId(), "Reconciliation: bank reports invalid account", TransferOutcomeService.ACTOR_SYSTEM_RECONCILIATION, attemptCount);
                 case FAILED_OTHER -> outcomeService.applyInternalError(
-                        withdrawalId, transfer.getId(), "Reconciliation: bank reports failure", TransferOutcomeService.ACTOR_SYSTEM_RECONCILIATION);
-                case NOT_FOUND -> outcomeService.resetForRetryAfterReconciliation(withdrawalId, transfer.getId());
+                        withdrawalId, transfer.getId(), "Reconciliation: bank reports failure", TransferOutcomeService.ACTOR_SYSTEM_RECONCILIATION, attemptCount);
+                case NOT_FOUND -> outcomeService.resetForRetryAfterReconciliation(withdrawalId, transfer.getId(), attemptCount);
             }
         } catch (RuntimeException e) {
             log.warn("Reconciliation lookup failed for withdrawal {}: {}", withdrawalId, e.getMessage());

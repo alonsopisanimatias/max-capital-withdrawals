@@ -10,7 +10,7 @@ import com.maxcapital.withdrawals.repository.TransferRepository;
 import com.maxcapital.withdrawals.repository.WithdrawalRepository;
 import com.maxcapital.withdrawals.repository.WithdrawalStatusHistoryRepository;
 import lombok.RequiredArgsConstructor;
-import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -18,13 +18,13 @@ import java.time.Instant;
 import java.util.UUID;
 
 /**
- * The five ways a transfer attempt can resolve, shared by TransferExecutionPoller (phase C)
+ * The six ways a transfer attempt can resolve, shared by TransferExecutionPoller (phase C)
  * and ReconciliationPoller so both apply outcomes through the exact same guarded path — see
  * {@link WithdrawalRepository#transitionFromProcessingTransfer} for why that guard exists (C6).
  * Each method is its own short REQUIRES_NEW transaction, deliberately never wrapping the slow
  * bank call itself.
  */
-@Component
+@Service
 @RequiredArgsConstructor
 public class TransferOutcomeService {
 
@@ -34,17 +34,26 @@ public class TransferOutcomeService {
     /** Past this many failed reconciliation lookups, stop retrying automatically and escalate. */
     private static final int MAX_RECONCILIATION_ATTEMPTS = 5;
 
+    /**
+     * Past this many transfer attempts on the same withdrawal, stop letting reconciliation send
+     * it back to AUTHORIZED for yet another try and escalate instead — without this, a bank
+     * outcome that reliably times out without applying retries forever: NOT_FOUND -> AUTHORIZED
+     * -> timeout -> NOT_FOUND -> ..., with nothing anywhere reading attempt_count to break it.
+     */
+    private static final int MAX_TRANSFER_ATTEMPTS = 5;
+
     private final WithdrawalRepository withdrawalRepository;
     private final TransferRepository transferRepository;
     private final AccountRepository accountRepository;
     private final WithdrawalStatusHistoryRepository historyRepository;
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void applySuccess(UUID withdrawalId, UUID transferId, String bankReference, String actor) {
+    public void applySuccess(UUID withdrawalId, UUID transferId, String bankReference, String actor, int expectedAttemptCount) {
         Withdrawal withdrawal = withdrawalRepository.findById(withdrawalId).orElseThrow();
-        int rows = withdrawalRepository.transitionFromProcessingTransfer(withdrawalId, WithdrawalStatus.EXECUTED.name(), actor, transferId);
+        int rows = withdrawalRepository.transitionFromProcessingTransfer(
+                withdrawalId, WithdrawalStatus.EXECUTED.name(), actor, transferId, expectedAttemptCount);
         if (rows == 0) {
-            return; // already resolved by a concurrent writer — never settle twice (C6)
+            return; // already resolved by a concurrent writer, or a stale attempt — never settle twice (C6)
         }
         accountRepository.settle(withdrawal.getAccountId(), withdrawal.getAmount());
 
@@ -58,9 +67,10 @@ public class TransferOutcomeService {
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void applyInvalidAccount(UUID withdrawalId, UUID transferId, String errorMessage, String actor) {
+    public void applyInvalidAccount(UUID withdrawalId, UUID transferId, String errorMessage, String actor, int expectedAttemptCount) {
         Withdrawal withdrawal = withdrawalRepository.findById(withdrawalId).orElseThrow();
-        int rows = withdrawalRepository.transitionFromProcessingTransfer(withdrawalId, WithdrawalStatus.FINAL_ERROR.name(), actor, null);
+        int rows = withdrawalRepository.transitionFromProcessingTransfer(
+                withdrawalId, WithdrawalStatus.FINAL_ERROR.name(), actor, null, expectedAttemptCount);
         if (rows == 0) {
             return;
         }
@@ -77,8 +87,9 @@ public class TransferOutcomeService {
 
     /** Reserve stays held: the operator can retry, and retry needs the funds still reserved. */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void applyInternalError(UUID withdrawalId, UUID transferId, String errorMessage, String actor) {
-        int rows = withdrawalRepository.transitionFromProcessingTransfer(withdrawalId, WithdrawalStatus.RETRYABLE_ERROR.name(), actor, null);
+    public void applyInternalError(UUID withdrawalId, UUID transferId, String errorMessage, String actor, int expectedAttemptCount) {
+        int rows = withdrawalRepository.transitionFromProcessingTransfer(
+                withdrawalId, WithdrawalStatus.RETRYABLE_ERROR.name(), actor, null, expectedAttemptCount);
         if (rows == 0) {
             return;
         }
@@ -93,33 +104,40 @@ public class TransferOutcomeService {
     }
 
     /**
-     * The ambiguous case: the withdrawal stays PROCESSING_TRANSFER (no guard needed — nothing
-     * about its status changes), only the transfer record reflects that reconciliation needs to
-     * resolve this one later.
+     * The ambiguous case: the withdrawal stays PROCESSING_TRANSFER, only the transfer record
+     * reflects that reconciliation needs to resolve this one later. Guarded by status = PENDING
+     * (the status claimOne() sets before calling the bank): if reconciliation already resolved
+     * this same transfer while this late timeout was still in flight — settling it to SUCCEEDED,
+     * or moving it to FAILED_* — that resolution already moved the status away from PENDING, so
+     * this write becomes a no-op instead of overwriting a real bank_reference/resolvedAt with
+     * "awaiting reconciliation".
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void markAwaitingReconciliation(UUID transferId, String errorMessage) {
-        Transfer transfer = transferRepository.findById(transferId).orElseThrow();
-        transfer.setStatus(TransferStatus.AWAITING_RECONCILIATION);
-        transfer.setLastError(errorMessage);
-        transferRepository.save(transfer);
+        transferRepository.markAwaitingReconciliationIfStillPending(transferId, errorMessage);
     }
 
     /**
      * Reconciliation confirmed the bank never applied it: safe to let the transfer poller pick
-     * it up again. Resets requested_at so reconciliation doesn't immediately re-flag it as
-     * "stuck" again before the transfer poller gets a chance to retry (PLAN_TECNICO_FINAL.md
-     * fix #6).
+     * it up again — unless this withdrawal has already burned through too many attempts, in
+     * which case looping back to AUTHORIZED again would just repeat whatever keeps failing
+     * (see {@link #MAX_TRANSFER_ATTEMPTS}). Resets requested_at (via
+     * {@link TransferRepository#markRequestedNow}) so reconciliation doesn't immediately
+     * re-flag it as "stuck" again before the transfer poller gets a chance to retry.
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void resetForRetryAfterReconciliation(UUID withdrawalId, UUID transferId) {
-        int rows = withdrawalRepository.transitionFromProcessingTransfer(withdrawalId, WithdrawalStatus.AUTHORIZED.name(), ACTOR_SYSTEM_RECONCILIATION, null);
+    public void resetForRetryAfterReconciliation(UUID withdrawalId, UUID transferId, int expectedAttemptCount) {
+        if (expectedAttemptCount >= MAX_TRANSFER_ATTEMPTS) {
+            transitionToManualReview(withdrawalId, expectedAttemptCount);
+            return;
+        }
+        int rows = withdrawalRepository.transitionFromProcessingTransfer(
+                withdrawalId, WithdrawalStatus.AUTHORIZED.name(), ACTOR_SYSTEM_RECONCILIATION, null, expectedAttemptCount);
         if (rows == 0) {
             return;
         }
         Transfer transfer = transferRepository.findById(transferId).orElseThrow();
         transfer.setStatus(TransferStatus.PENDING);
-        transfer.setRequestedAt(null);
         transferRepository.save(transfer);
 
         recordTransition(withdrawalId, WithdrawalStatus.PROCESSING_TRANSFER, WithdrawalStatus.AUTHORIZED, ACTOR_SYSTEM_RECONCILIATION);
@@ -127,20 +145,33 @@ public class TransferOutcomeService {
 
     /**
      * Reconciliation's own lookup failed (transient error querying the bank) — counts the
-     * attempt, and past {@link #MAX_RECONCILIATION_ATTEMPTS} gives up on automatic resolution
-     * rather than looping forever on a withdrawal nobody can currently explain.
+     * attempt atomically, and past {@link #MAX_RECONCILIATION_ATTEMPTS} gives up on automatic
+     * resolution rather than looping forever on a withdrawal nobody can currently explain.
+     *
+     * <p>Touches the withdrawal (native query, via {@link #transitionToManualReview}) BEFORE the
+     * transfer row, matching the lock order every other path in this class uses (withdrawal
+     * first). Doing it in the opposite order — saving a dirty transfer entity, then running a
+     * native query, which forces Hibernate to auto-flush that pending write first — would take
+     * transfer's lock before withdrawal's, and a concurrent claim (which always locks withdrawal
+     * first via SKIP LOCKED) taking the opposite order is a real deadlock between two instances.
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void recordFailedReconciliationAttempt(UUID withdrawalId, UUID transferId) {
         Transfer transfer = transferRepository.findById(transferId).orElseThrow();
-        transfer.setReconciliationAttempts(transfer.getReconciliationAttempts() + 1);
-        transferRepository.save(transfer);
+        int attempts = transfer.getReconciliationAttempts() + 1;
 
-        if (transfer.getReconciliationAttempts() >= MAX_RECONCILIATION_ATTEMPTS) {
-            int rows = withdrawalRepository.transitionFromProcessingTransfer(withdrawalId, WithdrawalStatus.MANUAL_REVIEW.name(), ACTOR_SYSTEM_RECONCILIATION, null);
-            if (rows > 0) {
-                recordTransition(withdrawalId, WithdrawalStatus.PROCESSING_TRANSFER, WithdrawalStatus.MANUAL_REVIEW, ACTOR_SYSTEM_RECONCILIATION);
-            }
+        if (attempts >= MAX_RECONCILIATION_ATTEMPTS) {
+            transitionToManualReview(withdrawalId, transfer.getAttemptCount());
+        }
+
+        transferRepository.incrementReconciliationAttempts(transferId);
+    }
+
+    private void transitionToManualReview(UUID withdrawalId, int expectedAttemptCount) {
+        int rows = withdrawalRepository.transitionFromProcessingTransfer(
+                withdrawalId, WithdrawalStatus.MANUAL_REVIEW.name(), ACTOR_SYSTEM_RECONCILIATION, null, expectedAttemptCount);
+        if (rows > 0) {
+            recordTransition(withdrawalId, WithdrawalStatus.PROCESSING_TRANSFER, WithdrawalStatus.MANUAL_REVIEW, ACTOR_SYSTEM_RECONCILIATION);
         }
     }
 

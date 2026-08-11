@@ -5,9 +5,13 @@ import com.maxcapital.withdrawals.domain.WithdrawalStatus;
 import com.maxcapital.withdrawals.domain.WithdrawalStatusHistory;
 import com.maxcapital.withdrawals.repository.AccountRepository;
 import com.maxcapital.withdrawals.repository.WithdrawalRepository;
+import com.maxcapital.withdrawals.repository.WithdrawalSpecifications;
 import com.maxcapital.withdrawals.repository.WithdrawalStatusHistoryRepository;
 import jakarta.persistence.EntityNotFoundException;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -88,6 +92,32 @@ public class WithdrawalService {
         return withdrawal;
     }
 
+    /**
+     * MANUAL_REVIEW means reconciliation gave up asking the bank (see
+     * {@link TransferOutcomeService#recordFailedReconciliationAttempt}) — the system genuinely
+     * doesn't know whether the transfer applied. There's no automatic way out of that state on
+     * purpose: only an operator, presumably after checking with the bank through a channel this
+     * system doesn't have, can close it. This releases the reserve and records it as a final
+     * error for follow-up. A real product would route this to a dedicated ops/reconciliation
+     * queue with more context than a single action; that queue is out of scope here (see
+     * DECISIONS.md) — what matters for this challenge is that MANUAL_REVIEW has a real exit
+     * instead of holding a reservation forever with no operator action available.
+     */
+    @Transactional
+    public Withdrawal resolveManualReview(UUID withdrawalId, String operatorId) {
+        Withdrawal withdrawal = loadForTransition(withdrawalId, WithdrawalStatus.MANUAL_REVIEW);
+        WithdrawalStatus previousStatus = withdrawal.getStatus();
+
+        withdrawal.setStatus(WithdrawalStatus.FINAL_ERROR);
+        withdrawal.setUpdatedAt(Instant.now());
+        withdrawal.setUpdatedBy(operatorId);
+        withdrawalRepository.save(withdrawal);
+        accountRepository.release(withdrawal.getAccountId(), withdrawal.getAmount());
+
+        recordTransition(withdrawal.getId(), previousStatus, WithdrawalStatus.FINAL_ERROR, operatorId);
+        return withdrawal;
+    }
+
     private Withdrawal loadForTransition(UUID withdrawalId, WithdrawalStatus expectedStatus) {
         Withdrawal withdrawal = withdrawalRepository.findById(withdrawalId)
                 .orElseThrow(() -> new EntityNotFoundException("Withdrawal not found: " + withdrawalId));
@@ -134,5 +164,21 @@ public class WithdrawalService {
         recordTransition(withdrawal.getId(), null, WithdrawalStatus.EVALUATING_RISK, ACTOR_CLIENT);
 
         return withdrawal;
+    }
+
+    @Transactional(readOnly = true)
+    public Withdrawal getById(UUID withdrawalId) {
+        return withdrawalRepository.findById(withdrawalId)
+                .orElseThrow(() -> new EntityNotFoundException("Withdrawal not found: " + withdrawalId));
+    }
+
+    @Transactional(readOnly = true)
+    public Page<Withdrawal> search(WithdrawalStatus status, Instant dateFrom, Instant dateTo, String search, Pageable pageable) {
+        Specification<Withdrawal> spec = Specification
+                .where(WithdrawalSpecifications.hasStatus(status))
+                .and(WithdrawalSpecifications.createdFrom(dateFrom))
+                .and(WithdrawalSpecifications.createdTo(dateTo))
+                .and(WithdrawalSpecifications.matchesSearch(search));
+        return withdrawalRepository.findAll(spec, pageable);
     }
 }
