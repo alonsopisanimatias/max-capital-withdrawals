@@ -22,27 +22,25 @@ estructura de lectura sea la misma cuando se complete.
 | Reserva atómica de saldo (C5) | Implementado + test de concurrencia |
 | Creación de retiro (`POST /api/withdrawals`) | Implementado |
 | Poller de evaluación de riesgo (C2 / C3) | Implementado + test de concurrencia |
-| Autorizar / rechazar con locking optimista (C4) | Implementado + test de concurrencia |
-| Poller de ejecución de transferencia (C1) | **Pendiente** |
-| Poller de reconciliación post-timeout (C6) | **Pendiente** |
-| Listado con filtros | **Pendiente** |
-| Frontend de backoffice | **Pendiente** (esqueleto Vite + React) |
-| docker-compose multi-instancia | **Pendiente** (hoy solo Postgres) |
+| Autorizar / rechazar / reintentar / resolver revisión manual, con locking optimista (C4) | Implementado + test de concurrencia |
+| Poller de ejecución de transferencia (C1) | Implementado + tests de los 4 desenlaces del banco |
+| Poller de reconciliación post-timeout (C6) | Implementado + tests de los 2 timeouts (aplicado / no aplicado) y del escalamiento a `MANUAL_REVIEW` con salida por operador |
+| Listado con filtros (`GET /api/withdrawals`) + detalle + cuentas | Implementado |
+| Frontend de backoffice (grilla, filtros, detalle con historial, autorizar/rechazar/reintentar/resolver, alta de retiro, polling, manejo de 409) | Implementado y verificado en navegador contra el stack real |
+| docker-compose multi-instancia | Implementado y validado end-to-end (`backend-1`/`backend-2`/`frontend` + Postgres) |
 
 Los estados `PROCESSING_TRANSFER`, `EXECUTED`, `FINAL_ERROR`, `RETRYABLE_ERROR` y
 `MANUAL_REVIEW` del enum `WithdrawalStatus`, y la tabla `transfer` completa, ya existen en el
-modelo porque el diseño de la máquina de estados se cerró antes de escribir código; todavía no
-hay código que escriba esos estados.
+modelo porque el diseño de la máquina de estados se cerró antes de escribir código.
 
 ---
 
 ## 1. Cómo correr el proyecto
 
-Las instrucciones detalladas van en `README.md` (pendiente, se escribe al cerrar el proyecto).
-En resumen: `docker compose up -d` levanta Postgres, Flyway aplica migraciones y seed al
-arrancar el backend (`backend/gradlew bootRun`), y `backend/gradlew test` corre la suite
-—requiere Docker corriendo, porque los tests de integración usan Testcontainers con un
-Postgres real (ver sección 11).
+Las instrucciones detalladas están en `README.md`. En resumen: `docker compose up -d` levanta
+Postgres, Flyway aplica migraciones y seed al arrancar el backend (`backend/gradlew bootRun`),
+y `backend/gradlew test` corre la suite —requiere Docker corriendo, porque los tests de
+integración usan Testcontainers con un Postgres real (ver sección 11).
 
 ---
 
@@ -133,9 +131,15 @@ aplicación no es una respuesta aceptable en un dominio regulado: los logs rotan
 transaccionales con el cambio de estado.
 
 El costo es bajo y acotado (un insert por transición, en la misma transacción que la
-transición, vía `WithdrawalService.recordTransition` y el equivalente en `RiskEvaluationPoller`),
-así que entra dentro del criterio de "no agregar features no pedidas": no es una feature de
-producto, es la tabla que el dominio exige.
+transición, vía `WithdrawalService.recordTransition` y el equivalente en `TransferOutcomeService`
+y `RiskEvaluationPoller`), así que entra dentro del criterio de "no agregar features no pedidas":
+no es una feature de producto, es la tabla que el dominio exige.
+
+`GET /api/withdrawals/{id}` la expone: `WithdrawalDetailResponse.history` es una lista de
+`HistoryEntry` (`previousStatus`, `newStatus`, `actor`, `occurredAt`), leída con
+`WithdrawalStatusHistoryRepository.findByWithdrawalIdOrderByOccurredAt` y ordenada de más viejo a
+más nuevo. Sin esto la tabla existía pero no había forma de que un operador o compliance la
+consultaran sin ir directo a la base — la trazabilidad quedaba en el modelo, no en el producto.
 
 *Alternativa descartada*: Hibernate Envers. Da versionado automático de toda la entidad, pero
 audita cambios de campos, no decisiones de negocio, y agrega una dependencia y un esquema
@@ -159,19 +163,26 @@ Nombres reales del enum en `domain/WithdrawalStatus.java`:
                      │                                        ▼
                      │                                    REJECTED  (libera reserva)
                      │
-                     │  [pendiente: TransferExecutionPoller]
+                     │  TransferExecutionPoller (fase A)
                      ▼
              PROCESSING_TRANSFER
                      │
      ┌───────────────┼────────────────┬─────────────────────┐
      ▼               ▼                ▼                     ▼
  EXECUTED     FINAL_ERROR      RETRYABLE_ERROR        MANUAL_REVIEW
- (settle)   (libera reserva)   (reintento manual)   (reconciliación agotada)
+ (settle)   (libera reserva)   (reintento manual)  (reconciliación agotada)
+                     ▲                                       │
+                     └──────── resolveManualReview() ────────┘
+                                (libera reserva)
 ```
 
-Transiciones implementadas hoy: las que salen de `EVALUATING_RISK` (`RiskEvaluationPoller`) y
-las de `PENDING_AUTHORIZATION` (`WithdrawalService.authorize` / `reject`). Todo lo que está
-debajo de `AUTHORIZED` está pendiente.
+Todas las transiciones del diagrama están implementadas: `EVALUATING_RISK` → `RiskEvaluationPoller`;
+`PENDING_AUTHORIZATION` → `WithdrawalService.authorize`/`reject`; `AUTHORIZED` →
+`PROCESSING_TRANSFER` → `TransferExecutionPoller` (fases A/B/C, sección 3); y desde
+`PROCESSING_TRANSFER` hacia `EXECUTED`/`FINAL_ERROR`/`RETRYABLE_ERROR`/de vuelta a `AUTHORIZED`/
+`MANUAL_REVIEW` → `TransferOutcomeService` + `ReconciliationPoller` (sección 8). `MANUAL_REVIEW`
+no es un final sin salida: `POST /{id}/resolve-manual-review` → `WithdrawalService.resolveManualReview`
+lo cierra a `FINAL_ERROR` liberando la reserva (sección 8).
 
 Dos decisiones de la máquina de estados que vale la pena defender:
 
@@ -188,25 +199,167 @@ Dos decisiones de la máquina de estados que vale la pena defender:
 
 ## 3. C1 — La llamada lenta al banco no bloquea al operador
 
-**Estado: pendiente** (se documenta cuando se implemente el `TransferExecutionPoller`).
+**Mecanismo**: `poller/TransferExecutionPoller`, partido en tres fases.
 
-Lo que ya está en el código y sostiene esta condición:
+El punto de partida es arquitectónico, no un truco de latencia: `WithdrawalService` **no tiene
+ninguna referencia a `BankService`**. `POST /{id}/authorize` cambia el estado a `AUTHORIZED`,
+escribe la fila de historia y responde, en el orden de milisegundos. La transferencia la ejecuta
+después un poller, en otro hilo y en otra transacción. Un operador no puede quedar esperando al
+banco porque no existe un camino de código desde el endpoint hasta el banco. El contrato lo dice
+en el javadoc de `BankService.executeTransfer`: *"never call this from a request thread or while
+holding a DB row lock (C1)"*.
 
-- `POST /{id}/authorize` (`WithdrawalController`) solo cambia el estado del retiro y escribe la
-  historia; no llama al banco. La respuesta vuelve en el orden de milisegundos.
-- El contrato lo dice explícitamente en el javadoc de `BankService.executeTransfer`: *"never
-  call this from a request thread or while holding a DB row lock (C1)"*.
-- `spring.task.scheduling.pool.size: 4` en `application.yml`. El default de Spring es **1**, lo
-  que serializaría los tres `@Scheduled` en un solo hilo y dejaría a la llamada de 3-10s del
-  banco bloqueando también al poller de riesgo. Es un bug de throughput real, no cosmético.
-- `withdrawals.poller.transfer-execution.bank-call-timeout-seconds: 15` — cota superior dura
-  del lado del cliente. Sin una cota no se puede dimensionar el grace period de la
-  reconciliación.
-- `hikari.maximum-pool-size: 15`, dimensionado para cubrir los hilos de poller más el tráfico
-  HTTP normal.
+**Fase A — claim** (`claimBatch()`, transacción corta `REQUIRES_NEW`). `lockNextBatchForTransfer`
+toma hasta `batch-size` (5) retiros en `AUTHORIZED` con `FOR UPDATE SKIP LOCKED`; para cada uno
+crea —o reutiliza, si es un reintento— la fila `transfer` con la idempotency key del retiro,
+incrementa `attempt_count`, sella `requested_at`, mueve el retiro a `PROCESSING_TRANSFER`, escribe
+la historia y commitea. El lock de fila dura exactamente eso: milisegundos. El método devuelve
+solo la lista de ids, no entidades, justamente porque lo que sigue ya no está en esa transacción.
 
-Falta implementar la ejecución en sí y su split en dos fases (claim transaccional corto →
-llamada al banco fuera de la transacción → escritura del resultado con UPDATE condicional).
+**Fase B — la llamada al banco** (`processOne`, despachado en `transferExecutionExecutor`, la
+llamada real al banco corriendo en `bankCallExecutor`, **sin transacción y sin lock**). Es la
+fase de 3-10s. Está fuera de toda transacción a propósito: sostenerla adentro significaría
+mantener el row lock durante toda la llamada (justo lo que C1 y C3 evitan) y tener una conexión
+de Hikari tomada por cada transferencia en vuelo sin hacer nada con ella.
+
+**Fase C — aplicar el resultado** (`TransferOutcomeService`). Cada desenlace se escribe en su
+propia transacción corta `REQUIRES_NEW`, guardada por el UPDATE condicional de C6 (sección 8).
+
+Por qué separadas así y no en una sola transacción como el poller de riesgo (sección 4): la fase
+A es un **compromiso persistido antes de la llamada externa**. Si el proceso muere durante la
+fase B, el retiro ya quedó en `PROCESSING_TRANSFER` con su `requested_at`, y la reconciliación lo
+encuentra. Si claim y llamada compartieran transacción, un rollback devolvería el retiro a
+`AUTHORIZED` y el próximo tick lo reintentaría **sin saber si el banco ya lo aplicó**, que es
+literalmente cómo se produce una transferencia doble. C1 y C6 no son dos diseños distintos: el
+split de fases resuelve los dos.
+
+**Dos pools dedicados, no uno** (`config/TransferExecutorConfig`):
+
+| Pool | Core | Max | Cola | Prefijo de hilo | Qué corre ahí |
+|---|---|---|---|---|---|
+| `transferExecutionExecutor` | 10 | 15 | 50 | `transfer-dispatch-` | `processOne`: las dos lecturas de antes, el `join()` bloqueado esperando la fase B, y la fase C |
+| `bankCallExecutor` | 6 | 8 | 20 | `bank-call-` | El único punto del código que llama `BankService.executeTransfer` |
+
+Por qué dos y no uno: el hilo que despacha (`transferExecutionExecutor`) pasa casi todo su tiempo
+bloqueado en `future.join()`, así que es barato tenerlo de sobra; el hilo que efectivamente llama
+al banco (`bankCallExecutor`) es el techo real de concurrencia contra el proveedor externo y tiene
+que quedar acotado aparte. Si la llamada al banco se despachara *de vuelta* sobre el mismo pool
+que la dispara, el sistema se auto-mata de hambre: en el peor caso los 15 hilos del dispatcher
+están todos bloqueados esperando un turno en `bankCallExecutor`, que nunca se libera porque nada
+más los dispara. Son dos responsabilidades con dos ritmos distintos —despachar es instantáneo,
+llamar al banco tarda 3-10s— y cada una necesita su propio techo.
+
+Tres decisiones más, dentro de eso:
+
+- **Ninguno de los dos es el pool de scheduling.** Si la fase B corriera ahí, ocho llamadas de
+  10s vaciarían los 4 hilos de `spring.task.scheduling.pool.size` y frenarían también al poller
+  de riesgo y al de reconciliación. El scheduler tiene que quedar libre para seguir tomando
+  lotes; es un pool para disparar trabajo, no para esperarlo.
+- **Ninguno es un executor sin cota.** Un pool ilimitado bajo un burst de autorizaciones es cómo
+  se termina con un número descontrolado de llamadas concurrentes contra el banco. 8 hilos en
+  `bankCallExecutor` son un techo explícito de concurrencia contra el proveedor externo.
+- **El dimensionamiento de `hikari.maximum-pool-size: 15` está atado a `bankCallExecutor` (8),
+  no al dispatcher.** El dispatcher toca la base solo al principio (dos lecturas) y al final (la
+  fase C), nunca durante el `join()`, así que aunque tenga hasta 15 hilos no retiene 15
+  conexiones a la vez. `bankCallExecutor` es el que fija el piso de conexiones que hacen falta
+  aparte del tráfico HTTP normal y los hilos de scheduling.
+
+**Timeout duro del lado del cliente** (`callBankWithTimeout`): el mock tarda 3-10s, pero un banco
+real puede no contestar nunca, y un worker de `bankCallExecutor` bloqueado para siempre es un
+worker menos hasta el próximo reinicio.
+
+```java
+CompletableFuture.supplyAsync(
+        () -> bankService.executeTransfer(...),
+        bankCallExecutor.getThreadPoolExecutor()
+).orTimeout(bankCallTimeoutSeconds, TimeUnit.SECONDS);
+```
+
+El executor explícito como segundo argumento no es cosmético: la variante de un solo argumento
+de `supplyAsync` corre sobre `ForkJoinPool.commonPool()`, que no es ninguno de los dos pools que
+este código controla — en un contenedor de pocos CPUs ese pool puede tener paralelismo 1 (las
+llamadas se serializan detrás del timeout) o directamente no existir como tal, cayendo en un
+executor sin cota por tarea, que es exactamente lo que un pool dedicado y acotado existe para
+evitar.
+
+`bank-call-timeout-seconds: 15`. Las excepciones chequeadas del banco se envuelven en
+`CompletionException` dentro del supplier y se desenvuelven en el `catch` de `join()`, para que
+cada tipo de fallo llegue a su rama en vez de colapsar todo en un error genérico. El
+`TimeoutException` propio se trata igual que el `BankTimeoutException` que reporta el banco: en
+los dos casos el sistema **no sabe** qué pasó, así que ninguno se resuelve como éxito ni como
+fallo. Sin esta cota tampoco habría con qué dimensionar el grace period de la reconciliación
+(30s > 15s, sección 8).
+
+**Detalle honesto**: el timeout de cliente no cancela la llamada en vuelo sobre `bankCallExecutor`
+— Java no puede interrumpir una llamada bloqueante sin cooperación del lado que bloquea. El hilo
+sigue ocupando un slot de `bankCallExecutor` hasta que la llamada real vuelve, aunque el poller ya
+haya seguido adelante tratándola como timeout. Por eso el techo real de concurrencia contra el
+banco en el peor caso es el tamaño de `bankCallExecutor` (8) y no el timeout: el timeout acota
+cuánto tarda el poller en *enterarse*, no cuántas llamadas siguen realmente en curso.
+
+Cada desenlace de la fase B tiene su rama explícita:
+
+| Resultado de la fase B | Fase C | Estado del retiro | Reserva |
+|---|---|---|---|
+| Éxito | `applySuccess` | `EXECUTED` | se debita (`settle`) |
+| `InvalidAccountException` | `applyInvalidAccount` | `FINAL_ERROR` | se libera |
+| `InternalErrorException` | `applyInternalError` | `RETRYABLE_ERROR` | se mantiene: el reintento la necesita |
+| `BankTimeoutException` o el `TimeoutException` propio | `markAwaitingReconciliation` | sigue en `PROCESSING_TRANSFER` | se mantiene |
+| `IdempotentRequestInProgressException` | ninguna, se loguea | sigue en `PROCESSING_TRANSFER` | se mantiene |
+
+El último caso no debería ocurrir —`SKIP LOCKED` garantiza un solo worker por retiro— y
+justamente por eso no se lo intenta resolver adivinando: se loguea y se deja que la reconciliación
+lo levante después del grace period. Un caso "imposible" que igual se auto-resuelve es mejor que
+un caso "imposible" que escribe un estado inventado.
+
+**Detalle que sostiene todo esto**: `tick()` llama a `self.claimBatch()` a través de una
+auto-referencia `@Lazy`, no `this.claimBatch()`. Una auto-invocación directa se saltea el proxy de
+Spring y **descarta silenciosamente** el `@Transactional(REQUIRES_NEW)`, con lo cual el claim
+correría sin transacción propia y sin el lock que lo hace seguro. No es teórico: el bug estaba en
+`RiskEvaluationPoller` y los tests no lo veían porque invocan el bean inyectado, que sí pasa por
+el proxy. Se corrigió en los tres pollers en el mismo commit.
+
+**Verificación**: `TransferExecutionPollerTest`, cuatro escenarios end-to-end contra Postgres real
+y el poller real (no un servicio mockeado):
+
+- `successfulTransferSettlesBalanceAndMarksExecuted` — `EXECUTED`, balance 100.000 → 99.900,
+  `reserved_balance` en 0, `transfer` en `SUCCEEDED` con `bankReference`, y el `transfer_id`
+  apuntado desde el retiro.
+- `invalidAccountEndsInFinalErrorAndReleasesReservedBalance` — `FINAL_ERROR`, reserva liberada y
+  balance real **intacto**: no se movió plata, solo se soltó lo comprometido.
+- `internalErrorEndsInRetryableErrorAndKeepsReservedBalance` — `RETRYABLE_ERROR` con la reserva
+  **todavía tomada**, porque el reintento del operador (`POST /{id}/retry`) la necesita.
+- `timeoutLeavesWithdrawalProcessingAndMarksTransferAwaitingReconciliation` — el retiro queda en
+  `PROCESSING_TRANSFER` y el `transfer` en `AWAITING_RECONCILIATION`. Nada se auto-resuelve.
+
+Que estos tests pasen es además la prueba indirecta de que la fase B corre fuera de la transacción
+del claim: si no fuera así, la fase C —que es `REQUIRES_NEW`, o sea otra conexión— intentaría un
+UPDATE sobre una fila que la transacción externa todavía tiene lockeada, y el test se colgaría
+esperando en vez de pasar.
+
+**Alternativas descartadas**:
+
+- *Llamar al banco en el request, aunque sea con un timeout corto*: es la alternativa que hay que
+  descartar con argumento porque suena razonable. No alcanza. Con un timeout de 2s el hilo del
+  contenedor y su conexión quedan tomados esos 2s por cada operador igual, y lo que satura Tomcat
+  bajo un burst de autorizaciones es la ocupación, no la lentitud en sí. Peor: si el proceso se
+  reinicia con la llamada en vuelo, no queda nada que continúe el trabajo — el retiro quedó
+  `AUTHORIZED` en la base y nadie lo va a retomar, o hay una transferencia aplicada en el banco de
+  la que el sistema no tiene registro. El poller sobrevive al reinicio porque el trabajo pendiente
+  está en una tabla, no en un hilo. Y el timeout corto tampoco elimina la ambigüedad: sigue
+  habiendo un caso en el que no se sabe si el banco aplicó, solo que ahora ocurre en el hilo HTTP
+  y con un operador mirando la pantalla.
+- *`@Async` disparado desde el endpoint*: responde rápido, pero la unidad de trabajo vive en la
+  cola en memoria del executor. Un reinicio la pierde y con 2 instancias no hay coordinación
+  alguna — mismo argumento que en C2 (sección 4), y acá el trabajo perdido mueve plata.
+- *Las tres fases en una sola transacción, como sí hace el poller de riesgo*: aceptable cuando el
+  trabajo externo es una lectura sin efecto y un rollback es gratis. Acá sostendría el row lock
+  10s y, sobre todo, un rollback dejaría el retiro en `AUTHORIZED` después de que el banco pudo
+  haber movido la plata.
+- *WebClient reactivo en vez de un pool de hilos*: escalaría mejor con miles de transferencias
+  concurrentes, pero el cuello acá es el banco, no el hilo bloqueado, y meter un modelo reactivo
+  en una aplicación que por lo demás es JDBC bloqueante (JPA, `SKIP LOCKED`, transacciones) es
+  pagar la complejidad de dos modelos de programación sin ganar nada al volumen del problema.
 
 ---
 
@@ -304,6 +457,20 @@ procesados. Las dos mitades de C3 en un solo test.
 Detalle de testing que importa: el test invoca `poller.processBatch()` sobre el **bean
 inyectado**, no sobre `this`. Si se invocara internamente, el proxy de Spring no se aplicaría,
 no habría transacción real, y el test podría pasar sin probar nada.
+
+**Evidencia real, no solo del test**: con `docker compose up` corriendo `backend-1` y
+`backend-2` de verdad, 6 retiros creados de una sola vez terminaron repartidos así (logs
+reales, filtrados por `claimed`):
+
+```
+[backend-1] risk evaluation claimed 1 withdrawal(s): [d0fd53d4-...]
+[backend-2] risk evaluation claimed 5 withdrawal(s): [64ff6f88-..., ffc9ccdf-..., 68f86a04-..., 776cc9ef-..., 63cf4760-...]
+[backend-1] transfer execution claimed 5 withdrawal(s): [64ff6f88-..., ffc9ccdf-..., 68f86a04-..., 776cc9ef-..., 63cf4760-...]
+[backend-2] transfer execution claimed 1 withdrawal(s): [d0fd53d4-...]
+```
+
+Cero superposición de IDs entre instancias en cada etapa, y los 6 retiros llegaron a `EXECUTED`
+sin ninguna intervención manual más allá del `POST` inicial.
 
 **Alternativas descartadas**:
 
@@ -472,16 +639,145 @@ con un job de expiración que mueve el retiro a `MANUAL_REVIEW` en vez de libera
 
 ## 8. C6 — Un retiro nunca genera dos transferencias reales
 
-**Estado: pendiente** (se documenta cuando se implementen el `TransferExecutionPoller` y el
-`ReconciliationPoller`).
+**Mecanismo**: cuatro piezas que se sostienen entre sí — una idempotency key por retiro,
+`PROCESSING_TRANSFER` escrito y commiteado **antes** de la llamada externa, un UPDATE condicional
+que impide la doble aplicación de un resultado, y una reconciliación que **consulta** en vez de
+reintentar. Ninguna de las cuatro alcanza sola.
 
-Lo que ya está en el código y sostiene esta condición:
-
-**Idempotency key por operación de negocio.** `withdrawal.idempotency_key` se genera una sola
+**1. Idempotency key por operación de negocio.** `withdrawal.idempotency_key` se genera una sola
 vez en `createWithdrawal`, es `updatable = false` y `unique` en la base, y `transfer` guarda
 exactamente el mismo valor (también `unique`). Todos los reintentos de un retiro usan la misma
-clave, así que el banco puede reconocerlos como el mismo intento. No es una idempotency key de
-request HTTP: es del intento de negocio, que es lo que sobrevive a reintentos y a reinicios.
+clave —el claim del poller reutiliza la fila `transfer` existente en vez de crear una nueva
+(`transferRepository.findByWithdrawalId(...).orElseGet(...)`)—, así que el banco puede
+reconocerlos como el mismo intento. No es una idempotency key de request HTTP: es del intento de
+negocio, que es lo que sobrevive a reintentos, a reinicios y a un operador apretando "reintentar"
+media hora después.
+
+**2. `PROCESSING_TRANSFER` es un compromiso persistido antes de llamar al banco.** La fase A del
+`TransferExecutionPoller` (sección 3) no es solo un claim: antes de que salga un solo byte hacia
+el banco, la base ya dice "este retiro tiene una transferencia en vuelo, con esta key, desde este
+`requested_at`". Eso es lo que hace crash-safe al sistema — si el proceso muere en medio de la
+llamada, o la respuesta vuelve 40 segundos tarde, o no vuelve nunca, el rastro no está en la
+memoria del hilo que murió sino en una fila. El `ReconciliationPoller` busca exactamente esa fila
+(`status = 'PROCESSING_TRANSFER'` con `t.requested_at` más viejo que el grace period) y la
+resuelve. El orden es el único correcto posible: comprometerse primero, llamar después. Al revés
+—llamar y recién después registrar que se llamó— existe una ventana en la que la plata se movió en
+el banco sin que el sistema tenga ningún registro de haberlo intentado, y de ahí no se vuelve.
+La misma query cubre gratis el caso "el proceso murió entre el claim y la llamada": el retiro
+queda en `PROCESSING_TRANSFER` con un `requested_at` viejo y la reconciliación lo trata igual que
+a un timeout.
+
+**3. El guard contra la doble aplicación** (`WithdrawalRepository.transitionFromProcessingTransfer`):
+
+```sql
+UPDATE withdrawal
+SET status = :newStatus,
+    updated_at = now(),
+    updated_by = :actor,
+    transfer_id = COALESCE(:transferId, transfer_id)
+WHERE id = :id
+  AND status = 'PROCESSING_TRANSFER'
+  AND (SELECT t.attempt_count FROM transfer t WHERE t.withdrawal_id = :id) = :expectedAttemptCount
+```
+
+Es el corazón de C6. Los cinco caminos de `TransferOutcomeService` que resuelven un intento pasan
+por acá, y **todos chequean `rows == 0` y se van sin hacer nada** si el UPDATE no afectó ninguna
+fila. `expectedAttemptCount` es el `attempt_count` que `processOne` leyó de la fila `transfer`
+**antes** de llamar al banco (sección 3), no el actual al momento de aplicar el resultado.
+
+La carrera concreta que ataja, y por qué el `status = 'PROCESSING_TRANSFER'` solo no alcanza: el
+intento 1 hace timeout de cliente a los 15s pero la llamada real sigue viva contra el banco.
+Mientras tanto la reconciliación consulta, ve `NOT_FOUND`, y `resetForRetryAfterReconciliation`
+devuelve el retiro a `AUTHORIZED` — el `TransferExecutionPoller` lo reclama de nuevo, incrementa
+`attempt_count` a 2 y el retiro vuelve a `PROCESSING_TRANSFER`, ahora para el intento 2. Si en ese
+momento llega la respuesta tardía del intento 1 (el banco sí lo había aplicado) y llama a
+`applySuccess`, un guard que solo mirara `status = 'PROCESSING_TRANSFER'` **matchearía igual** —el
+retiro está en ese estado, solo que por el intento 2— y aplicaría el resultado del intento 1
+encima del trabajo en curso del intento 2: doble débito o un `bankReference` que no corresponde al
+intento que realmente está resolviéndose. El chequeo de `attempt_count` es lo que distingue "esta
+fila sigue en el estado que autoriza mi escritura" de "esta fila volvió a este mismo estado por
+otro motivo". El caso más simple —fase B tardía llegando después de que la reconciliación ya
+resolvió el mismo intento a `EXECUTED`— también lo cubre, porque ahí ni siquiera el `status`
+matchea.
+
+Que el chequeo de `rows == 0` esté **antes** de `settle`/`release` y no después no es casual: el
+efecto sobre el saldo es precisamente el que no se puede repetir. `COALESCE(:transferId,
+transfer_id)` permite que la misma query sirva para las cinco transiciones sin borrar el
+`transfer_id` en las cuatro que no lo traen.
+
+Es un UPDATE condicional y no `@Version` (que es el mecanismo de C4, sección 6) porque acá el
+escritor puede no tener la entidad cargada ni haber leído la fila en esta transacción: viene de un
+hilo del executor, después de una llamada externa que duró segundos. La condición que importa no
+es "nadie cambió la fila desde que la leí", es "la fila sigue exactamente en el estado que
+autoriza esta escritura".
+
+**4. La regla de oro: después de un timeout nunca se reintenta a ciegas, siempre se pregunta.**
+`markAwaitingReconciliation` es el único camino que **no** resuelve nada sobre el retiro: deja el
+retiro en `PROCESSING_TRANSFER` (por eso no pasa por `transitionFromProcessingTransfer` — no hay
+transición de estado del retiro que guardar) y solo marca el `transfer` como
+`AWAITING_RECONCILIATION`, vía `TransferRepository.markAwaitingReconciliationIfStillPending`. Esa
+escritura tiene su propio guard, más chico pero con la misma idea: `WHERE id = :id AND status =
+'PENDING'`. Cubre la carrera simétrica a la de arriba pero sobre `transfer` en vez de `withdrawal`
+— si mientras la fase B todavía está en vuelo la reconciliación ya resolvió el mismo intento
+(a `SUCCEEDED` o a un `FAILED_*`), el `status` del `transfer` ya dejó de ser `PENDING`, y esta
+escritura tardía se vuelve un no-op en vez de pisar un `bank_reference`/`resolvedAt` reales con
+"esperando reconciliación". Después, `ReconciliationPoller.reconcileOne`
+consulta con `queryByIdempotencyKey` y mapea la respuesta del banco a un desenlace:
+
+| Respuesta del banco | Acción | Resultado |
+|---|---|---|
+| `APPLIED` | `applySuccess` con la `bankReference` real | `EXECUTED` + débito |
+| `FAILED_INVALID_ACCOUNT` | `applyInvalidAccount` | `FINAL_ERROR` + libera la reserva |
+| `FAILED_OTHER` | `applyInternalError` | `RETRYABLE_ERROR`, reserva retenida |
+| `NOT_FOUND` | `resetForRetryAfterReconciliation` | vuelve a `AUTHORIZED`, `transfer` a `PENDING` con `requested_at = null` — salvo que ya haya agotado los reintentos (ver abajo), en cuyo caso va directo a `MANUAL_REVIEW` |
+| La consulta misma falla | `recordFailedReconciliationAttempt` | cuenta el intento; a los 5, `MANUAL_REVIEW` |
+
+Solo la rama `NOT_FOUND` habilita un reintento, y lo hace porque el banco **confirmó** que no
+aplicó nada. `resetForRetryAfterReconciliation` limpia `requested_at` a propósito, para que la
+reconciliación no vuelva a marcar el mismo retiro como colgado antes de que el poller de
+transferencia alcance a reintentarlo. Hay dos techos independientes en `TransferOutcomeService`,
+los dos en `MANUAL_REVIEW`: `MAX_RECONCILIATION_ATTEMPTS` (5) para cuando la consulta al banco en
+sí misma sigue fallando (`recordFailedReconciliationAttempt`), y `MAX_TRANSFER_ATTEMPTS` (5) para
+cuando el banco contesta `NOT_FOUND` una y otra vez y el reintento automático nunca converge —
+sin este segundo techo, un desenlace que siempre hace timeout sin aplicar reintentaría para
+siempre (`NOT_FOUND` → `AUTHORIZED` → timeout → `NOT_FOUND` → …). Los dos casos terminan en la
+misma cola humana porque un retiro que nadie puede explicar, o que nadie puede completar, tiene
+que salir del loop automático y no quedarse en él indefinidamente.
+
+**`MANUAL_REVIEW` tiene una salida real, no es un final sin operador.**
+`POST /api/withdrawals/{id}/resolve-manual-review` → `WithdrawalService.resolveManualReview`
+(requiere `X-Operator-Id`, igual que `authorize`/`reject`/`retry`) cierra el retiro a
+`FINAL_ERROR` y libera la reserva en la misma transacción, con su fila en
+`withdrawal_status_history`. Antes de esto `MANUAL_REVIEW` era alcanzable pero no tenía ningún
+camino de salida en el código — un operador podía ver el retiro en esa cola pero no había endpoint
+que le permitiera cerrarlo, y la reserva de saldo quedaba tomada indefinidamente. Verificado por
+`ReconciliationPollerTest.repeatedReconciliationLookupFailuresEscalateToManualReviewWithOperatorExit`
+(sección 11), que fuerza los 5 fallos de lookup, confirma el escalamiento y después llama
+`resolveManualReview` para comprobar que la reserva se libera.
+
+El grace period (`grace-period-seconds: 30`) tiene que ser mayor que el timeout de cliente (15s),
+si no la reconciliación empezaría a preguntar por transferencias que todavía están legítimamente
+en vuelo. La comparación se hace con `now()` de Postgres y no con el reloj de la JVM: con 2+
+instancias hay clock skew, y lo que decide qué fila es elegible tiene que salir de un solo reloj
+(sección 12).
+
+**El lock de la reconciliación es sobre `withdrawal`, no sobre `transfer`.**
+`lockNextBatchForReconciliation` joinea `transfer` para filtrar por `requested_at`, pero lockea con
+`FOR UPDATE OF w SKIP LOCKED`, o sea únicamente las filas de `withdrawal`. Es deliberado: el
+`TransferExecutionPoller` también lockea `withdrawal`, así que los dos pollers comparten **una
+sola sección crítica por agregado**. Con la reconciliación lockeando `transfer` habría dos
+esquemas de locking independientes sobre el mismo agregado, y podrían cruzarse — el poller de
+transferencia tomando el retiro mientras la reconciliación tiene tomado su transfer, cada uno
+creyendo que es dueño de la operación.
+
+Además, el claim de la reconciliación **bumpea `requested_at` dentro de la misma transacción que
+sostiene el lock**. Sin esa escritura el lock se soltaría al commitear la transacción corta del
+claim, y la fila —que sigue matcheando el mismo filtro de "más vieja que el grace period"— podría
+ser tomada por otra instancia antes de que `reconcileOne` termine. Es el equivalente a lo que el
+poller de transferencia obtiene gratis al escribir `PROCESSING_TRANSFER` en su propio claim; la
+reconciliación no tiene un estado nuevo al que mover el retiro, así que reutiliza `requested_at`
+como marca de claim. Si la resolución nunca termina, la fila vuelve a ser elegible después de otro
+grace period completo: se auto-cura, no queda tomada para siempre.
 
 **El mock del banco implementa la semántica exacta que hace que C6 sea demostrable**
 (`external/mock/BankServiceMock`, replicada en `TestBankService` para los tests):
@@ -499,6 +795,16 @@ nunca resuelve por su cuenta un timeout ambiguo. Un timeout con `applied = false
 como `NOT_FOUND` (equivalente a "no pasó nada, es seguro reintentar"); uno con `applied = true`
 se reporta como `APPLIED` con su `bankReference`, y en ese caso reintentar sería un doble pago.
 
+*Detalle que importa bajo C3*: esa verdad de fondo vive en Postgres (`bank_mock_ledger` /
+`bank_mock_in_flight`, `V3__bank_mock_ledger.sql`), no en un `Map` dentro del proceso. Un banco
+real tiene una sola verdad de fondo sin importar quién pregunta; un mapa en memoria le daba a
+este mock una verdad **distinta por instancia**. Con 2+ backends (la demo de docker-compose),
+`backend-1` podía cachear en su propio heap un resultado que la reconciliación corriendo en
+`backend-2` — otra JVM — nunca iba a ver, y lo leía como `NOT_FOUND` cuando en realidad ya había
+una respuesta. La exclusión mutua de `executeTransfer` (antes un `Set` en memoria) también se
+persiste: la clave primaria de `bank_mock_in_flight` es lo que hace atómico el claim entre
+instancias, vía `INSERT ... ON CONFLICT DO NOTHING`.
+
 *Supuesto explícito*: el enunciado no dice que el banco ofrezca una consulta por idempotency
 key. Se asumió porque sin ella un timeout es irresoluble — cualquier decisión (reintentar o
 dar por fallido) sería adivinar, y una de las dos ramas duplica plata. Es el supuesto más
@@ -507,9 +813,55 @@ fuerte del diseño y está declarado como tal en la sección 12.
 **Verificación de esa semántica**: `BankServiceMockTest` cubre los cinco casos (error interno
 no cacheado y reintentable, cuenta inválida terminal y cacheada, timeout aplicado visible como
 `APPLIED`, timeout no aplicado visible como `NOT_FOUND` y reintentable, éxito replayable con la
-misma `bankReference`).
+misma `bankReference`). `TestBankService` replica la misma semántica sin la latencia, así que los
+tests de los pollers ejercitan el contrato real y no una versión simplificada de él.
 
-Falta implementar los dos pollers y el UPDATE condicional que aplica el resultado una sola vez.
+**Verificación de la condición**: `ReconciliationPollerTest`, los dos escenarios que importan, de
+punta a punta contra Postgres real:
+
+- `timeoutThatDidApplyIsResolvedToExecutedByReconciliation` — timeout con la transferencia
+  **sí** aplicada. El poller de transferencia deja el `transfer` en `AWAITING_RECONCILIATION`,
+  pasa el grace period, la reconciliación consulta, ve `APPLIED` y resuelve a `EXECUTED` con
+  débito real (100.000 → 99.900) y la `bankReference` que dio el banco. Nunca se vuelve a llamar
+  a `executeTransfer`: la plata ya se movió una vez y el sistema se limita a enterarse.
+- `timeoutThatNeverAppliedIsResetAndSucceedsOnAutomaticRetry` — timeout con la transferencia
+  **no** aplicada. La consulta devuelve `NOT_FOUND`, el retiro vuelve a `AUTHORIZED` con el
+  `transfer` en `PENDING` y la reserva intacta (el timeout por sí solo nunca toca el saldo), y el
+  poller de transferencia lo reintenta solo hasta `EXECUTED`. La aserción que cierra C6:
+  `testBankService.executionCount(idempotencyKey) == 2` — exactamente dos llamadas reales al banco
+  en toda la historia del retiro (la que hizo timeout y el reintento), las dos con la **misma**
+  idempotency key, y un único débito de 100.
+
+La única concesión de estos tests es bajar `grace-period-seconds` a 2 en `application-test.yml`
+para no dormir 30 segundos; la lógica ejercitada es exactamente la de producción.
+
+**Alternativas descartadas**:
+
+- *Reintentar automáticamente después de un timeout, sin consultar antes*: es el procedimiento
+  exacto para generar una transferencia doble. Un timeout significa "no sé", y una parte de las
+  veces significa "el banco aplicó y la respuesta se perdió"; un reintento ciego en ese caso manda
+  una segunda transferencia real. La única razón por la que acá no duplicaría es que el mock
+  cachea por idempotency key — y apoyarse en eso sería confundir la garantía del banco con la del
+  propio sistema: si el banco no cacheara, o cacheara por menos tiempo del que tarda el reintento,
+  sale la plata dos veces. El diseño no depende de la buena voluntad del proveedor: pregunta
+  primero.
+- *Dar el timeout por fallido y liberar la reserva*: la rama opuesta, y es peor. Si el banco sí
+  aplicó, se libera saldo de un retiro que ya se pagó y la cuenta puede volver a comprometer plata
+  que no tiene. Descartado por el mismo motivo: es adivinar sobre un resultado que se puede
+  consultar.
+- *Que la reconciliación lockee la fila `transfer`*: es lo primero que uno haría —el que está en
+  `AWAITING_RECONCILIATION` es el `transfer`— pero rompe la unificación de la sección crítica que
+  se explica arriba y deja dos esquemas de locking sobre el mismo agregado.
+- *Un estado `RECONCILING` explícito en vez de bumpear `requested_at`*: funcionaría, pero agrega
+  un estado técnico más a la parte más cargada del dominio, y necesita su propia recuperación
+  cuando un proceso muere justo en ese estado. Marcar con un timestamp que ya existe, con
+  elegibilidad definida por tiempo, se auto-cura sin código adicional.
+- *Confiar solo en el `UNIQUE` de la base*: la unicidad de `withdrawal.idempotency_key` y de
+  `transfer.idempotency_key` está y sirve, pero solo impide dos **filas**. No impide dos
+  **llamadas** al banco con la misma fila, que es la duplicación que mueve plata.
+- *Idempotency key por request HTTP*, el patrón clásico de API: protege contra el doble click del
+  cliente al crear el retiro, no contra el reintento que el sistema hace contra el banco tres
+  minutos más tarde. Son dos problemas distintos y C6 es el segundo.
 
 ---
 
@@ -573,9 +925,12 @@ buscó que cada condición crítica con concurrencia tenga un test que la ejerci
 | Test | Qué cubre |
 |---|---|
 | `AccountReservationConcurrencyTest` | **C5** — 20 hilos simultáneos contra la misma cuenta; exactamente 16 reservas, 4 rechazos, `reserved <= balance` |
-| `RiskEvaluationPollerTest` | **C2/C3** — auto-autorización LOW, `PENDING_AUTHORIZATION` en HIGH, fail-safe ante fallo del servicio, y 2 pollers concurrentes que nunca evalúan dos veces el mismo retiro |
+| `RiskEvaluationPollerTest` | **C2/C3** — auto-autorización LOW, `PENDING_AUTHORIZATION` en HIGH, fail-safe ante fallo del servicio, 2 pollers concurrentes que nunca evalúan dos veces el mismo retiro, y un test dedicado que pasa por el `tick()` real (no `processBatch()` directo) — guarda de regresión para el bug de auto-invocación: ningún otro test de esta clase habría detectado que `self.processBatch()` volviera a ser `this.processBatch()` |
 | `WithdrawalServiceAuthorizationTest` | **C4** — authorize/reject felices, precondición de estado inválido, y la carrera authorize-vs-reject con verificación del saldo reservado final |
-| `BankServiceMockTest` | Contrato de idempotencia sobre el que se apoya **C6** (5 escenarios de caché + query) |
+| `TransferExecutionPollerTest` | **C1/C6** — los 4 desenlaces del banco: éxito (settle + `EXECUTED`), cuenta inválida (`FINAL_ERROR` + libera reserva), error interno (`RETRYABLE_ERROR` + reserva intacta), timeout (`AWAITING_RECONCILIATION`, retiro nunca sale de `PROCESSING_TRANSFER`); más **C3** para `lockNextBatchForTransfer` — 12 retiros, 2 pollers concurrentes, `executionCount == 1` para cada uno |
+| `ReconciliationPollerTest` | **C6** — timeout que sí se aplicó resuelto a `EXECUTED`; timeout que no se aplicó, reseteado y reintentado con éxito, verificando `executionCount == 2` (nunca una tercera llamada real al banco); fallas repetidas del lookup de reconciliación escalando a `MANUAL_REVIEW` con salida real vía operador; más **C3** para `lockNextBatchForReconciliation` (`concurrentPollersResolveEachStuckWithdrawalWithoutDoubleApplying`) — 12 retiros stuck, 2 pollers concurrentes. A diferencia de los tests de concurrencia de `RiskEvaluationPollerTest`/`TransferExecutionPollerTest`, acá no se afirma que la consulta al banco corra exactamente una vez: el claim de la reconciliación solo bumpea `requested_at` (no cambia el status), así que una resolución lenta puede legítimamente dejar un retiro elegible de nuevo después de otro grace period — self-healing a propósito, no un bug. Lo que sí es una garantía real, y lo que el test afirma, es que el estado final nunca se aplica dos veces (status `AUTHORIZED`, `transfer` en `PENDING`, reserva intacta en 100.00 para cada uno de los 12), gracias al guard de `transitionFromProcessingTransfer` |
+| `WithdrawalSearchTest` | Filtros del listado (status, rango de fechas, búsqueda por CBU parcial o cuenta exacta) |
+| `BankServiceMockTest` | Contrato de idempotencia sobre el que se apoya **C6** (5 escenarios de caché + query). Corre contra Postgres real (no una unidad pura): desde que la verdad de fondo del mock vive en `bank_mock_ledger`/`bank_mock_in_flight` (sección 8), ya no hay lógica en memoria que aislar de la base |
 | `RiskServiceMockTest` | Convención de forzado por decimales (barato, evita que un cambio la rompa en silencio y arruine las demos) |
 | `AccountRepositoryTest` | Sanity de Flyway y del mapeo de la entidad |
 
@@ -659,9 +1014,10 @@ cuentas; ahora afirma que existen las filas sembradas específicas).
 - **`account_number` es `varchar(20)`**, lo que obliga a los tests a sembrar identificadores
   cortos (`ACC-` + 8 chars) en vez de un UUID completo.
 - **Timestamps**: los de auditoría se escriben con el reloj de la JVM (`Instant.now()`). Las
-  comparaciones temporales que decidan comportamiento **entre instancias** (el grace period de
-  la reconciliación) deben usar `now()` de Postgres, porque con 2+ instancias hay skew de
-  reloj; aplica a la parte pendiente de C6.
+  comparaciones temporales que deciden comportamiento **entre instancias** (el grace period de
+  la reconciliación) usan `now()` de Postgres — `lockNextBatchForReconciliation` compara contra
+  el reloj del motor, no el de ninguna JVM, precisamente porque con 2+ instancias hay skew de
+  reloj (sección 8).
 
 ---
 

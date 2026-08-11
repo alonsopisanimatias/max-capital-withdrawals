@@ -15,7 +15,59 @@ services:
       timeout: 5s
       retries: 10
 
-  # backend-1, backend-2 and frontend are added in Block 9/12 once the app itself exists.
+  # Two identical instances, not one behind a load balancer: the point of C3 is correctness of
+  # background processing across instances, not HTTP traffic distribution, so each is reachable
+  # directly on its own port for the demo (logs tagged by INSTANCE_ID show them claiming
+  # disjoint rows via SKIP LOCKED — see README for how to watch that live).
+  backend-1:
+    build: ./backend
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: withdrawals
+      DB_USER: withdrawals
+      DB_PASSWORD: withdrawals
+      INSTANCE_ID: backend-1
+    ports:
+      - "8081:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  backend-2:
+    build: ./backend
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: withdrawals
+      DB_USER: withdrawals
+      DB_PASSWORD: withdrawals
+      INSTANCE_ID: backend-2
+    ports:
+      - "8082:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend-1
+      - backend-2
 
 volumes:
   postgres-data:
