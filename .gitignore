@@ -7,6 +7,7 @@ backend/out/
 # frontend
 frontend/node_modules/
 frontend/dist/
+frontend/*.tsbuildinfo
 
 # IDE / OS
 .idea/
