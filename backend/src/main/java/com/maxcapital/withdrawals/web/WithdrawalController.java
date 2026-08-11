@@ -16,6 +16,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.web.PageableDefault;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.HttpStatus;
+import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -32,6 +33,11 @@ import java.util.UUID;
 @RestController
 @RequestMapping("/api/withdrawals")
 @RequiredArgsConstructor
+// required for @NotBlank on @RequestHeader params to actually be enforced — unlike
+// @Valid @RequestBody, method-parameter constraints (@RequestHeader/@RequestParam/@PathVariable)
+// are silently no-ops without this. Without it, X-Operator-Id: "" (present but blank) passed
+// straight through and got persisted as the actor in withdrawal_status_history.
+@Validated
 public class WithdrawalController {
 
     private final WithdrawalService withdrawalService;

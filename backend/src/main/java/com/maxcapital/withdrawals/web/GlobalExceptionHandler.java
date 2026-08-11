@@ -7,6 +7,7 @@ import com.maxcapital.withdrawals.service.InvalidTransitionException;
 import com.maxcapital.withdrawals.web.dto.ConflictResponse;
 import com.maxcapital.withdrawals.web.dto.ErrorResponse;
 import jakarta.persistence.EntityNotFoundException;
+import jakarta.validation.ConstraintViolationException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -69,6 +70,20 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleValidationError(MethodArgumentNotValidException ex) {
         String message = ex.getBindingResult().getFieldErrors().stream()
                 .map(error -> error.getField() + ": " + error.getDefaultMessage())
+                .collect(Collectors.joining(", "));
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(new ErrorResponse("VALIDATION_ERROR", message));
+    }
+
+    // Bean Validation on a method parameter (@RequestHeader/@RequestParam/@PathVariable, e.g.
+    // @NotBlank X-Operator-Id) — different exception type than @Valid @RequestBody's
+    // MethodArgumentNotValidException above. Requires @Validated on the controller class to even
+    // fire; without it these constraints are silently never checked (see WithdrawalController's
+    // javadoc on @Validated for the concrete gap this closed).
+    @ExceptionHandler(ConstraintViolationException.class)
+    public ResponseEntity<ErrorResponse> handleConstraintViolation(ConstraintViolationException ex) {
+        String message = ex.getConstraintViolations().stream()
+                .map(v -> v.getPropertyPath() + ": " + v.getMessage())
                 .collect(Collectors.joining(", "));
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .body(new ErrorResponse("VALIDATION_ERROR", message));
