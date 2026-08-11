@@ -16,7 +16,6 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Function;
 
 /**
  * Instant, fully controllable stand-in used by automated tests. Applies the same caching
