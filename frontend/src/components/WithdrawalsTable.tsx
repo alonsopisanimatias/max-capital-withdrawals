@@ -58,47 +58,56 @@ export function WithdrawalsTable({ withdrawals, operatorId, onSelect }: Props) {
               <td>{w.riskLevel ? RISK_LABELS[w.riskLevel] : '—'}</td>
               <td>{formatDate(w.createdAt)}</td>
               <td>{w.updatedBy ? actorLabel(w.updatedBy) : '—'}</td>
-              <td className="actions-cell">
-                {w.status === 'PENDING_AUTHORIZATION' && (
-                  <>
+              <td>
+                {/* The flex layout lives on this inner div, not on the <td> itself: a <td>
+                    with display:flex stops behaving like a table cell for row-height purposes
+                    (it no longer stretches to match its row's height, it sizes to its own
+                    content instead), which is exactly what made this cell sit shorter than its
+                    row and look "misaligned" even though every individual measurement inside
+                    it was internally consistent. Keeping the <td> a plain table cell lets it
+                    stretch normally; the div only handles the horizontal gap between buttons. */}
+                <div className="actions-cell">
+                  {w.status === 'PENDING_AUTHORIZATION' && (
+                    <>
+                      <button
+                        className="btn btn-small btn-primary"
+                        disabled={noOperator || authorize.isPending}
+                        title={noOperator ? 'Ingresá tu ID de operador primero' : undefined}
+                        onClick={(e) => run(authorize, w.id, e)}
+                      >
+                        Autorizar
+                      </button>
+                      <button
+                        className="btn btn-small btn-danger"
+                        disabled={noOperator || reject.isPending}
+                        title={noOperator ? 'Ingresá tu ID de operador primero' : undefined}
+                        onClick={(e) => run(reject, w.id, e)}
+                      >
+                        Rechazar
+                      </button>
+                    </>
+                  )}
+                  {w.status === 'RETRYABLE_ERROR' && (
                     <button
                       className="btn btn-small btn-primary"
-                      disabled={noOperator || authorize.isPending}
+                      disabled={noOperator || retry.isPending}
                       title={noOperator ? 'Ingresá tu ID de operador primero' : undefined}
-                      onClick={(e) => run(authorize, w.id, e)}
+                      onClick={(e) => run(retry, w.id, e)}
                     >
-                      Autorizar
+                      Reintentar
                     </button>
+                  )}
+                  {w.status === 'MANUAL_REVIEW' && (
                     <button
                       className="btn btn-small btn-danger"
-                      disabled={noOperator || reject.isPending}
-                      title={noOperator ? 'Ingresá tu ID de operador primero' : undefined}
-                      onClick={(e) => run(reject, w.id, e)}
+                      disabled={noOperator || resolveManualReview.isPending}
+                      title={noOperator ? 'Ingresá tu ID de operador primero' : 'Resolver revisión manual'}
+                      onClick={(e) => run(resolveManualReview, w.id, e)}
                     >
-                      Rechazar
+                      Resolver
                     </button>
-                  </>
-                )}
-                {w.status === 'RETRYABLE_ERROR' && (
-                  <button
-                    className="btn btn-small btn-primary"
-                    disabled={noOperator || retry.isPending}
-                    title={noOperator ? 'Ingresá tu ID de operador primero' : undefined}
-                    onClick={(e) => run(retry, w.id, e)}
-                  >
-                    Reintentar
-                  </button>
-                )}
-                {w.status === 'MANUAL_REVIEW' && (
-                  <button
-                    className="btn btn-small btn-danger"
-                    disabled={noOperator || resolveManualReview.isPending}
-                    title={noOperator ? 'Ingresá tu ID de operador primero' : 'Resolver revisión manual'}
-                    onClick={(e) => run(resolveManualReview, w.id, e)}
-                  >
-                    Resolver
-                  </button>
-                )}
+                  )}
+                </div>
               </td>
             </tr>
           ))}

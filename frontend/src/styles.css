@@ -165,11 +165,9 @@ td {
 }
 
 td {
-  /* Rows with an action button (a pill with its own padding) render visibly taller than
-     plain-text rows — 47px vs 42px, measured — which reads as the button being misaligned even
-     though it's centered within its own (taller) row: the row-height jump itself is the bug.
-     A fixed content-box height (browsers treat table-cell height as a floor, not a hard cap)
-     makes every row the same height, button or not. */
+  /* A floor, not a cap — table cells grow past this if their content needs more room, this
+     just keeps short rows from looking cramped. Not what fixed the actions-column alignment
+     bug (see .actions-cell below for the real cause). */
   height: 27px;
 }
 
@@ -246,8 +244,14 @@ tbody tr:hover {
 }
 
 .actions-cell {
+  /* This is a div INSIDE a <td> now, not the <td> itself — see WithdrawalsTable.tsx for why:
+     display:flex directly on a table cell takes it out of normal row-height participation, so
+     it no longer stretches to match its row (it sizes to its own content instead), which is
+     what actually caused the "floating button" misalignment. height: 100% makes this div fill
+     the <td>'s real, row-stretched height, and align-items centers the button(s) within that. */
   display: flex;
   align-items: center;
+  height: 100%;
   gap: 6px;
 }
 
