@@ -8,9 +8,8 @@ interface Props {
   onSelect: (id: string) => void;
 }
 
-function formatAmount(amount: string): string {
-  const n = Number(amount);
-  return n.toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+function formatAmount(amount: number): string {
+  return amount.toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function formatDate(iso: string): string {

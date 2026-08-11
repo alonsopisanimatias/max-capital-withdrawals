@@ -16,8 +16,15 @@ export class ApiError extends Error {
     return this.status === 409;
   }
 
+  // Not every 409 is a ConflictResponse — INSUFFICIENT_BALANCE (from POST /withdrawals) is a
+  // plain ErrorResponse with no currentStatus/updatedBy. Checking the shape instead of blindly
+  // casting means a future 409 that isn't a real conflict body fails this check (falls back to
+  // the generic error message) instead of silently rendering "undefined" in a toast.
   get conflict(): ConflictResponse | null {
-    return this.isConflict ? (this.body as ConflictResponse) : null;
+    if (!this.isConflict || this.body === null || !('currentStatus' in this.body)) {
+      return null;
+    }
+    return this.body as ConflictResponse;
   }
 }
 

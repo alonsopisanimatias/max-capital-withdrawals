@@ -7,13 +7,24 @@ export interface CreateWithdrawalRequest {
   amount: string;
 }
 
+// The backend binds dateFrom/dateTo as Instant (ISO.DATE_TIME) — a bare `<input type="date">`
+// value like "2026-08-10" won't parse, so it needs widening to a full day. That day has to be
+// the operator's LOCAL calendar day (e.g. Argentina, UTC-3), not UTC's — anchoring to
+// "2026-08-10T00:00:00Z" would cut off the last 3 hours of the 10th and the first 3 of the 11th
+// from the operator's point of view. `new Date(y, m, d, h, ...)` builds the Date in the
+// browser's local timezone; `.toISOString()` then converts that instant to UTC correctly.
+function localDayBoundaryToIsoInstant(dateStr: string, endOfDay: boolean): string {
+  const [year, month, day] = dateStr.split('-').map(Number);
+  return endOfDay
+    ? new Date(year, month - 1, day, 23, 59, 59, 999).toISOString()
+    : new Date(year, month - 1, day, 0, 0, 0, 0).toISOString();
+}
+
 function buildQuery(filters: WithdrawalFilters): string {
   const params = new URLSearchParams();
   if (filters.status) params.set('status', filters.status);
-  // the backend binds these as Instant (ISO.DATE_TIME) — a bare `<input type="date">` value like
-  // "2026-08-10" would fail to parse, so widen it to the full day in UTC before sending.
-  if (filters.dateFrom) params.set('dateFrom', `${filters.dateFrom}T00:00:00Z`);
-  if (filters.dateTo) params.set('dateTo', `${filters.dateTo}T23:59:59Z`);
+  if (filters.dateFrom) params.set('dateFrom', localDayBoundaryToIsoInstant(filters.dateFrom, false));
+  if (filters.dateTo) params.set('dateTo', localDayBoundaryToIsoInstant(filters.dateTo, true));
   if (filters.search) params.set('search', filters.search);
   params.set('page', String(filters.page ?? 0));
   params.set('size', String(filters.size ?? 20));

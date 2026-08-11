@@ -47,7 +47,7 @@ export function WithdrawalDetail({ id, operatorId, onClose }: Props) {
             </div>
             <div className="field-row">
               <span className="label">Monto</span>
-              <span className="value">${Number(withdrawal.amount).toLocaleString('es-AR', { minimumFractionDigits: 2 })}</span>
+              <span className="value">${withdrawal.amount.toLocaleString('es-AR', { minimumFractionDigits: 2 })}</span>
             </div>
             <div className="field-row">
               <span className="label">Estado</span>
@@ -96,8 +96,13 @@ export function WithdrawalDetail({ id, operatorId, onClose }: Props) {
 
             <div className="section-title">Historial</div>
             {withdrawal.history.length === 0 && <div className="empty-state">Sin movimientos.</div>}
-            {withdrawal.history.map((h, idx) => (
-              <div className="history-item" key={idx}>
+            {withdrawal.history.map((h) => (
+              // no synthetic id on HistoryEntry (backend doesn't have one either — it's a plain
+              // projection of withdrawal_status_history), but occurredAt + newStatus is unique
+              // per row in practice (an append-only history never has two transitions to the
+              // same status at the exact same instant) and is stable across re-renders/polls,
+              // unlike the array index.
+              <div className="history-item" key={`${h.occurredAt}-${h.newStatus}`}>
                 <div>
                   {h.previousStatus ? `${h.previousStatus} → ${h.newStatus}` : `Creado en ${h.newStatus}`}
                   {' · '}

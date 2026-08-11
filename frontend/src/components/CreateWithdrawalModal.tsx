@@ -7,6 +7,10 @@ interface Props {
 }
 
 const CBU_PATTERN = /^[0-9]{22}$/;
+// mirrors the backend's @Digits(integer = 16, fraction = 2) on CreateWithdrawalRequest.amount —
+// up to 16 integer digits, up to 2 decimals, so a malformed amount is rejected inline instead of
+// only after a round-trip to the server.
+const AMOUNT_PATTERN = /^\d{1,16}(\.\d{1,2})?$/;
 
 export function CreateWithdrawalModal({ onClose }: Props) {
   const { data: accounts, isLoading: accountsLoading } = useAccounts();
@@ -23,7 +27,7 @@ export function CreateWithdrawalModal({ onClose }: Props) {
     if (!CBU_PATTERN.test(destinationCbu)) next.destinationCbu = 'El CBU debe tener exactamente 22 dígitos.';
     const parsed = Number(amount);
     if (!amount || Number.isNaN(parsed) || parsed <= 0) next.amount = 'Ingresá un monto mayor a cero.';
-    else if (!/^\d+(\.\d{1,2})?$/.test(amount)) next.amount = 'Máximo 2 decimales.';
+    else if (!AMOUNT_PATTERN.test(amount)) next.amount = 'Máximo 16 dígitos enteros y 2 decimales.';
     setErrors(next);
     return Object.keys(next).length === 0;
   }
@@ -55,7 +59,7 @@ export function CreateWithdrawalModal({ onClose }: Props) {
             {accounts?.map((account) => (
               <option key={account.id} value={account.id}>
                 {account.accountNumber} — {account.holderName} (disp. $
-                {(Number(account.balance) - Number(account.reservedBalance)).toLocaleString('es-AR', { minimumFractionDigits: 2 })})
+                {(account.balance - account.reservedBalance).toLocaleString('es-AR', { minimumFractionDigits: 2 })})
               </option>
             ))}
           </select>

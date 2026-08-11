@@ -22,7 +22,12 @@ export interface WithdrawalResponse {
   id: string;
   accountId: string;
   destinationCbu: string;
-  amount: string;
+  // BigDecimal on the Java side, serialized by Jackson as a JSON number (no @JsonFormat
+  // shape=STRING anywhere) — a real number on the wire, not a string. CreateWithdrawalRequest's
+  // amount below is the opposite direction and genuinely IS a string: Jackson coerces a JSON
+  // string into BigDecimal on deserialization, and sending it as a string from the create form
+  // avoids float-precision surprises when the user types "1500.99".
+  amount: number;
   status: WithdrawalStatus;
   riskLevel: RiskLevel | null;
   createdAt: string;
@@ -54,8 +59,8 @@ export interface AccountResponse {
   id: string;
   accountNumber: string;
   holderName: string;
-  balance: string;
-  reservedBalance: string;
+  balance: number;
+  reservedBalance: number;
 }
 
 export interface PageResponse<T> {
