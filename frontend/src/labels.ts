@@ -52,3 +52,20 @@ const SYSTEM_ACTOR_LABELS: Record<string, string> = {
 export function actorLabel(actor: string): string {
   return SYSTEM_ACTOR_LABELS[actor] ?? actor;
 }
+
+// ErrorResponse.error is a stable code (GlobalExceptionHandler) meant for API consumers, not
+// end users — its .message is free text in English and sometimes includes a raw internal id
+// (e.g. "Insufficient available balance for account <uuid>"). Map the stable code to a Spanish
+// message instead of ever showing that raw text in a toast; anything not in this map is a
+// genuinely unexpected error, so it falls back to a generic message rather than leaking English.
+const API_ERROR_MESSAGES: Record<string, string> = {
+  INSUFFICIENT_BALANCE: 'Saldo insuficiente para este retiro.',
+  NOT_FOUND: 'No se encontró lo que buscabas.',
+  VALIDATION_ERROR: 'Los datos ingresados no son válidos.',
+  INVALID_REQUEST: 'La solicitud no es válida.',
+  INTERNAL_ERROR: 'Ocurrió un error inesperado. Intentá de nuevo en unos segundos.',
+};
+
+export function apiErrorMessage(errorCode: string | undefined): string {
+  return API_ERROR_MESSAGES[errorCode ?? ''] ?? 'Ocurrió un error inesperado. Intentá de nuevo en unos segundos.';
+}

@@ -2,7 +2,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { withdrawalsApi, type CreateWithdrawalRequest } from '../api/withdrawals';
 import { ApiError } from '../api/client';
 import { useToasts } from './useToasts';
-import { actorLabel, STATUS_LABELS } from '../labels';
+import { actorLabel, apiErrorMessage, STATUS_LABELS } from '../labels';
 
 type Action = (id: string, operatorId: string) => Promise<unknown>;
 
@@ -33,7 +33,7 @@ function useAction(action: Action, successMessage: string) {
         queryClient.invalidateQueries({ queryKey: ['withdrawals'] });
         queryClient.invalidateQueries({ queryKey: ['withdrawal', id] });
       } else if (error instanceof ApiError) {
-        notify('error', error.message);
+        notify('error', apiErrorMessage(error.body?.error));
       } else {
         notify('error', 'Error inesperado. Reintentá en unos segundos.');
       }
@@ -62,7 +62,7 @@ export function useCreateWithdrawal() {
       queryClient.invalidateQueries({ queryKey: ['accounts'] });
     },
     onError: (error) => {
-      notify('error', error instanceof ApiError ? error.message : 'No se pudo crear el retiro.');
+      notify('error', error instanceof ApiError ? apiErrorMessage(error.body?.error) : 'No se pudo crear el retiro.');
     },
   });
 }

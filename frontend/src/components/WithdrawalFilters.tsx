@@ -31,6 +31,10 @@ export function WithdrawalFiltersBar({ filters, onChange }: Props) {
   // keystroke — without this, every character typed into a 22-digit CBU fired its own request.
   const [searchInput, setSearchInput] = useState(filters.search ?? '');
 
+  // Both bounds are ISO yyyy-mm-dd strings from the native date inputs, so a plain string
+  // comparison is a correct range check without parsing Date objects.
+  const rangeInvalid = Boolean(filters.dateFrom && filters.dateTo && filters.dateFrom > filters.dateTo);
+
   useEffect(() => {
     setSearchInput(filters.search ?? '');
   }, [filters.search]);
@@ -56,14 +60,15 @@ export function WithdrawalFiltersBar({ filters, onChange }: Props) {
           ))}
         </select>
       </label>
-      <label>
-        Desde
-        <input type="date" value={filters.dateFrom ?? ''} onChange={(e) => update({ dateFrom: e.target.value || undefined })} />
-      </label>
-      <label>
-        Hasta
-        <input type="date" value={filters.dateTo ?? ''} onChange={(e) => update({ dateTo: e.target.value || undefined })} />
-      </label>
+      <div className="date-range-field">
+        <span className="date-range-label">Rango de fechas</span>
+        <div className={`date-range-inputs${rangeInvalid ? ' date-range-inputs-invalid' : ''}`}>
+          <input type="date" value={filters.dateFrom ?? ''} onChange={(e) => update({ dateFrom: e.target.value || undefined })} />
+          <span className="date-range-arrow">→</span>
+          <input type="date" value={filters.dateTo ?? ''} onChange={(e) => update({ dateTo: e.target.value || undefined })} />
+        </div>
+        {rangeInvalid && <span className="field-error">"Desde" es posterior a "Hasta"</span>}
+      </div>
       <label style={{ flex: 1, minWidth: 200 }}>
         Buscar (CBU o cuenta)
         <input

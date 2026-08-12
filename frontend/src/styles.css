@@ -14,6 +14,10 @@
   --warning: #f5a623;
   --radius: 8px;
   --radius-pill: 999px;
+  /* Without this, Chrome draws native form controls (the date input's calendar icon, in
+     particular) assuming a light UI — a near-black icon on this app's near-black background,
+     effectively invisible even though it's still clickable. */
+  color-scheme: dark;
 }
 
 * {
@@ -150,9 +154,49 @@ button {
   font-size: 13px;
 }
 
+/* Desde/Hasta as one visual control instead of two loose fields: a single shared border reads
+   as "a range", where two separate bordered inputs with their own labels read as two unrelated
+   filters — that ambiguity, not the dd/mm/aaaa format, was the actual source of confusion. */
+.date-range-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.date-range-inputs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  padding: 0 8px;
+}
+
+.date-range-inputs input {
+  border: none;
+  background: transparent;
+  padding: 6px 2px;
+}
+
+.date-range-inputs-invalid {
+  border-color: var(--negative);
+}
+
+.date-range-arrow {
+  color: var(--text-dim);
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
+  /* Fixed layout + explicit widths per <th> (WithdrawalsTable.tsx) so column widths don't
+     recompute from visible row content — without this, a status badge changing text length
+     (e.g. "Ejecutado" -> "Procesando transferencia") reflows every column, most visibly with
+     few rows on screen where one row's content is most of the sizing signal. */
+  table-layout: fixed;
 }
 
 th,
@@ -165,10 +209,10 @@ td {
 }
 
 td {
-  /* A floor, not a cap — table cells grow past this if their content needs more room, this
-     just keeps short rows from looking cramped. Not what fixed the actions-column alignment
-     bug (see .actions-cell below for the real cause). */
-  height: 27px;
+  /* Matches the real floor set by a row's tallest cell: the actions <button> (padding + border)
+     measures ~47px including the cell's own padding, taller than a plain text row (~42px). This
+     was 27px before, which no longer applied to anything — every row already exceeded it. */
+  height: 47px;
 }
 
 th {
@@ -370,7 +414,8 @@ tbody tr:hover {
   font-size: 13px;
 }
 
-.form-field .field-error {
+.form-field .field-error,
+.date-range-field .field-error {
   color: var(--negative);
   font-size: 12px;
 }

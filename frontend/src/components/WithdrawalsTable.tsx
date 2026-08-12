@@ -36,14 +36,18 @@ export function WithdrawalsTable({ withdrawals, operatorId, onSelect }: Props) {
       <table>
         <thead>
           <tr>
-            <th>ID</th>
-            <th>CBU destino</th>
-            <th>Monto</th>
-            <th>Estado</th>
-            <th>Riesgo</th>
-            <th>Creado</th>
-            <th>Actualizado por</th>
-            <th>Acciones</th>
+            {/* Explicit widths + table-layout: fixed (styles.css) so a status badge or actor
+                name changing length doesn't reflow every column — most visible with few rows
+                on screen, where one row's content is most of the sizing signal. Estado is sized
+                for its longest real label, "Procesando transferencia". */}
+            <th style={{ width: 90 }}>ID</th>
+            <th style={{ width: 170 }}>CBU destino</th>
+            <th style={{ width: 110 }}>Monto</th>
+            <th style={{ width: 190 }}>Estado</th>
+            <th style={{ width: 80 }}>Riesgo</th>
+            <th style={{ width: 120 }}>Creado</th>
+            <th style={{ width: 150 }}>Actualizado por</th>
+            <th style={{ width: 160 }}>Acciones</th>
           </tr>
         </thead>
         <tbody>
