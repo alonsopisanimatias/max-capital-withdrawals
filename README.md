@@ -1,52 +1,53 @@
-# Max Capital — Withdrawals Portal
+# Max Capital — Portal de Retiros
 
-Technical challenge for a Full Stack Engineer position: a withdrawals portal where a client requests a
-withdrawal, the system evaluates risk asynchronously, an operator authorizes or rejects the ones that need
-manual review, and the money is transferred through an (mocked) external bank service.
+Challenge técnico para un puesto de Full Stack Engineer: un portal de retiros donde un cliente pide un
+retiro, el sistema evalúa el riesgo de forma asíncrona, un operador autoriza o rechaza los que necesitan
+revisión manual, y la plata se transfiere a través de un servicio de banco externo (mockeado).
 
 ## Stack
 
-| Layer | Technology |
+| Capa | Tecnología |
 | --- | --- |
-| Backend | Java 21, Spring Boot 3.3.4, Gradle 8.10 (wrapper included) |
-| Persistence | PostgreSQL 16, Spring Data JPA, Flyway migrations |
-| Tests | JUnit 5, Spring Boot Test, Testcontainers 1.21.3 (real Postgres, no H2) |
+| Backend | Java 21, Spring Boot 3.3.4, Gradle 8.10 (wrapper incluido) |
+| Persistencia | PostgreSQL 16, Spring Data JPA, migraciones Flyway |
+| Tests | JUnit 5, Spring Boot Test, Testcontainers 1.21.3 (Postgres real, no H2) |
 | Frontend | React 18, TypeScript 5.6, Vite 5.4, TanStack Query 5 |
 
-The Gradle project lives in `backend/` (`backend/gradlew`), so every Gradle command below is run from that
-directory.
+El proyecto Gradle vive en `backend/` (`backend/gradlew`), así que todos los comandos de Gradle de abajo
+se corren desde esa carpeta.
 
-## Prerequisites
+## Requisitos previos
 
-- JDK 21 (the Gradle toolchain targets Java 21)
-- Docker Desktop running (needed for Postgres, and required by the test suite)
-- Node.js 18+ (only for the frontend)
+- JDK 21 (el toolchain de Gradle apunta a Java 21)
+- Docker Desktop corriendo (hace falta para Postgres, y lo requiere la suite de tests)
+- Node.js 18+ (solo para el frontend)
 
-## Running it locally
+## Cómo correrlo localmente
 
-### Option A — everything, via docker compose
+### Opción A — todo junto, vía docker compose
 
 ```bash
 docker compose up -d --build
 ```
 
-This builds and starts Postgres, **two backend instances** (`backend-1` on `localhost:8081`, `backend-2` on
-`localhost:8082`) and the frontend (`localhost:5173`, static build served by nginx, proxying `/api` to
-`backend-1` — see [Project status](#project-status)). Each backend logs its `INSTANCE_ID`, so you can watch
-the two claim disjoint rows from the pollers (`docker compose logs -f backend-1 backend-2 | grep claimed`).
-Health:
+Esto construye y levanta Postgres, **dos instancias del backend** (`backend-1` en `localhost:8081`,
+`backend-2` en `localhost:8082`) y el frontend (`localhost:5173`, build estático servido por nginx, que
+proxea `/api` a `backend-1` — ver [Estado del proyecto](#estado-del-proyecto)). Cada backend loguea su
+`INSTANCE_ID`, así que se puede ver a las dos instancias reclamando filas disjuntas desde los pollers
+(`docker compose logs -f backend-1 backend-2 | grep claimed`). Salud:
 
 ```bash
 curl -s http://localhost:8081/actuator/health
 curl -s http://localhost:8082/actuator/health
 ```
 
-Talk to either instance interchangeably for the API examples below — they share the same Postgres. Tear down
-with `docker compose down` (add `-v` to also drop the seeded data volume).
+Da lo mismo hablarle a cualquiera de las dos instancias en los ejemplos de la API de abajo — comparten el
+mismo Postgres. Para bajar todo: `docker compose down` (agregar `-v` para borrar también el volumen con los
+datos sembrados).
 
-### Option B — backend running locally against a containerized Postgres
+### Opción B — backend corriendo local contra un Postgres en contenedor
 
-Useful for iterating on the backend without rebuilding the image each time.
+Útil para iterar sobre el backend sin reconstruir la imagen cada vez.
 
 ```bash
 docker compose up -d postgres
@@ -54,9 +55,9 @@ cd backend
 ./gradlew bootRun          # Windows: .\gradlew.bat bootRun
 ```
 
-Database `withdrawals`, user `withdrawals`, password `withdrawals`, published on `localhost:5432`. The
-defaults in `backend/src/main/resources/application.yml` already point at it, so no environment variables are
-needed. Override them if your setup differs:
+Base `withdrawals`, usuario `withdrawals`, contraseña `withdrawals`, publicado en `localhost:5432`. Los
+valores por defecto en `backend/src/main/resources/application.yml` ya apuntan ahí, así que no hace falta
+ninguna variable de entorno. Se pueden sobreescribir si tu setup es distinto:
 
 | Variable | Default |
 | --- | --- |
@@ -66,13 +67,13 @@ needed. Override them if your setup differs:
 | `DB_USER` | `withdrawals` |
 | `DB_PASSWORD` | `withdrawals` |
 | `SERVER_PORT` | `8080` |
-| `INSTANCE_ID` | `local` (tags the poller claim logs; `backend-1`/`backend-2` under compose) |
+| `INSTANCE_ID` | `local` (tagea los logs de claim de los pollers; `backend-1`/`backend-2` bajo compose) |
 
-Flyway runs the migrations on startup and seeds three demo accounts (see below).
+Flyway corre las migraciones al arrancar y siembra tres cuentas de demo (ver abajo).
 
 ```bash
 curl -s http://localhost:8080/actuator/health
-curl -s http://localhost:8080/api/accounts   # three rows means the whole stack is wired
+curl -s http://localhost:8080/api/accounts   # tres filas significa que todo el stack está bien conectado
 ```
 
 ### Frontend
@@ -83,41 +84,43 @@ npm install
 npm run dev            # http://localhost:5173
 ```
 
-`npm run dev` proxies `/api` to `http://localhost:8080` by default (a locally-run backend, Option B above) —
-override with `VITE_API_PROXY_TARGET` if you're pointing at `docker compose`'s `8081`/`8082` instead:
+`npm run dev` proxea `/api` a `http://localhost:8080` por defecto (un backend corriendo local, Opción B de
+arriba) — sobreescribilo con `VITE_API_PROXY_TARGET` si en cambio querés apuntar al `8081`/`8082` de
+`docker compose`:
 
 ```bash
 VITE_API_PROXY_TARGET=http://localhost:8081 npm run dev
 ```
 
-Under `docker compose up` (Option A), no proxy env var is needed — nginx handles it (`frontend/nginx.conf`).
+Bajo `docker compose up` (Opción A), no hace falta ninguna variable de proxy — nginx se encarga
+(`frontend/nginx.conf`).
 
 ## Tests
 
-The test suite uses Testcontainers, which starts its own throwaway Postgres. It does **not** use the
-`docker-compose.yml` database — only a running Docker daemon is required.
+La suite de tests usa Testcontainers, que levanta su propio Postgres descartable. **No** usa la base de
+`docker-compose.yml` — solo necesita un daemon de Docker corriendo.
 
 ```bash
 cd backend
 ./gradlew test         # Windows: .\gradlew.bat test
 ```
 
-HTML report: `backend/build/reports/tests/test/index.html`.
+Reporte HTML: `backend/build/reports/tests/test/index.html`.
 
-## Trying the API by hand
+## Probando la API a mano
 
-### Seed accounts (`V2__seed_data.sql`)
+### Cuentas sembradas (`V2__seed_data.sql`)
 
-| ID | Account number | Holder | Balance |
+| ID | Número de cuenta | Titular | Balance |
 | --- | --- | --- | --- |
-| `11111111-1111-1111-1111-111111111111` | ACC-001 | Juan Perez | 1,000,000.00 |
-| `22222222-2222-2222-2222-222222222222` | ACC-002 | Maria Gomez | 50,000.00 |
-| `33333333-3333-3333-3333-333333333333` | ACC-003 | Carlos Ruiz | 250,000.00 |
+| `11111111-1111-1111-1111-111111111111` | ACC-001 | Juan Perez | 1.000.000,00 |
+| `22222222-2222-2222-2222-222222222222` | ACC-002 | Maria Gomez | 50.000,00 |
+| `33333333-3333-3333-3333-333333333333` | ACC-003 | Carlos Ruiz | 250.000,00 |
 
-ACC-002 is deliberately seeded close to a realistic limit so a burst of concurrent withdrawals visibly hits
-insufficient balance.
+`ACC-002` está sembrada a propósito cerca de un límite realista, para que un burst de retiros concurrentes
+choque visiblemente contra saldo insuficiente.
 
-### Create a withdrawal
+### Crear un retiro
 
 ```bash
 curl -i -X POST http://localhost:8080/api/withdrawals \
@@ -129,83 +132,85 @@ curl -i -X POST http://localhost:8080/api/withdrawals \
   }'
 ```
 
-`destinationCbu` must be exactly 22 digits and `amount` must be positive, with at most 16 integer digits and
-2 decimal places (matching the `numeric(18,2)` column). The response is `201` with the
-withdrawal in `EVALUATING_RISK` and `riskLevel: null` — risk is evaluated off the request thread by a
-background poller, so the status changes a couple of seconds later. Follow it with the detail endpoint, which
-also carries the transfer attempt once there is one:
+`destinationCbu` tiene que ser de exactamente 22 dígitos y `amount` tiene que ser positivo, con hasta 16
+dígitos enteros y 2 decimales (coincidiendo con la columna `numeric(18,2)`). La respuesta es `201` con el
+retiro en `EVALUATING_RISK` y `riskLevel: null` — el riesgo se evalúa fuera del hilo del request, por un
+poller de background, así que el estado cambia unos segundos después. Seguilo con el endpoint de detalle,
+que también trae el intento de transferencia una vez que existe:
 
 ```bash
 curl -s http://localhost:8080/api/withdrawals/<withdrawal-id>
-curl -s "http://localhost:8080/api/withdrawals?size=5&sort=createdAt,desc"   # or the whole grid
+curl -s "http://localhost:8080/api/withdrawals?size=5&sort=createdAt,desc"   # o la grilla completa
 ```
 
-The database is still the fastest way to eyeball several at once while a load test is running:
+La base de datos sigue siendo la forma más rápida de ver varios de un vistazo mientras corre una prueba de
+carga:
 
 ```bash
 docker compose exec postgres psql -U withdrawals -d withdrawals \
   -c "select id, status, risk_level, updated_by from withdrawal order by created_at desc limit 5;"
 ```
 
-`LOW`/`MEDIUM` risk moves the withdrawal to `AUTHORIZED` automatically; `HIGH` risk — and any failure of the
-risk service, which is treated as high risk on purpose — moves it to `PENDING_AUTHORIZATION`, where an
-operator has to resolve it:
+Riesgo `LOW`/`MEDIUM` mueve el retiro a `AUTHORIZED` automáticamente; riesgo `HIGH` — y cualquier falla del
+servicio de riesgo, que a propósito se trata como riesgo alto — lo mueve a `PENDING_AUTHORIZATION`, donde un
+operador tiene que resolverlo:
 
 ```bash
 curl -i -X POST http://localhost:8080/api/withdrawals/<withdrawal-id>/authorize \
   -H "X-Operator-Id: operator-1"
 ```
 
-From `AUTHORIZED` onwards nothing has to be called by hand: the transfer-execution poller claims the
-withdrawal on its next tick (every second), moves it to `PROCESSING_TRANSFER`, calls the bank and resolves it
-as `EXECUTED`, `RETRYABLE_ERROR` or `FINAL_ERROR`. If the bank times out, the withdrawal stays in
-`PROCESSING_TRANSFER` until the reconciliation poller asks the bank what really happened (30 s grace period,
-checked every 5 s). Only `RETRYABLE_ERROR` needs an operator again — the reserve is still held, so the same
-withdrawal can be sent back to `AUTHORIZED` for another attempt with the same idempotency key:
+De `AUTHORIZED` en adelante no hace falta llamar nada a mano: el poller de ejecución de transferencia
+reclama el retiro en su próximo tick (cada segundo), lo mueve a `PROCESSING_TRANSFER`, llama al banco y lo
+resuelve como `EXECUTED`, `RETRYABLE_ERROR` o `FINAL_ERROR`. Si el banco hace timeout, el retiro se queda en
+`PROCESSING_TRANSFER` hasta que el poller de reconciliación le pregunta al banco qué pasó realmente (grace
+period de 30 s, chequeado cada 5 s). Solo `RETRYABLE_ERROR` necesita un operador de nuevo — la reserva
+sigue tomada, así que el mismo retiro puede volver a `AUTHORIZED` para otro intento con la misma
+idempotency key:
 
 ```bash
 curl -i -X POST http://localhost:8080/api/withdrawals/<withdrawal-id>/retry \
   -H "X-Operator-Id: operator-1"
 ```
 
-### Forcing outcomes from the mocks
+### Forzar desenlaces de los mocks
 
-The risk and bank mocks are random by default (realistic latency and failure rates), but a specific outcome
-can be forced from the **last two decimal digits of the amount**, so scenarios can be reproduced by hand
-without touching code.
+Los mocks de riesgo y banco son aleatorios por defecto (latencia y tasas de falla realistas), pero se puede
+forzar un desenlace específico desde los **últimos dos decimales del monto**, así los escenarios se pueden
+reproducir a mano sin tocar código.
 
-`RiskServiceMock` (1–3 s latency, otherwise ~15% failures and weighted levels):
+`RiskServiceMock` (1–3 s de latencia, si no ~15% de fallas y niveles ponderados):
 
-| Amount ends in | Outcome |
+| Monto termina en | Desenlace |
 | --- | --- |
-| `.96` | risk `LOW` |
-| `.97` | risk `MEDIUM` |
-| `.98` | risk evaluation throws (fail-safe path → `PENDING_AUTHORIZATION`) |
-| `.99` | risk `HIGH` → `PENDING_AUTHORIZATION` |
+| `.96` | riesgo `LOW` |
+| `.97` | riesgo `MEDIUM` |
+| `.98` | la evaluación de riesgo tira una excepción (camino fail-safe → `PENDING_AUTHORIZATION`) |
+| `.99` | riesgo `HIGH` → `PENDING_AUTHORIZATION` |
 
-`BankServiceMock` (3–10 s latency, otherwise ~5% internal errors / ~3% timeouts / ~2% invalid account):
+`BankServiceMock` (3–10 s de latencia, si no ~5% error interno / ~3% timeout / ~2% cuenta inválida):
 
-| Amount ends in | Outcome |
+| Monto termina en | Desenlace |
 | --- | --- |
-| `.13` | internal error (not cached per idempotency key — a retry can succeed) |
-| `.14` | timeout where the transfer **did** apply on the bank side |
-| `.15` | timeout where the transfer did **not** apply |
-| `.16` | invalid destination account (terminal, cached per idempotency key) |
-| `.50` | guaranteed success (handy to retry deterministically after a forced failure) |
+| `.13` | error interno (no se cachea por idempotency key — un reintento puede tener éxito) |
+| `.14` | timeout donde la transferencia **sí** se aplicó del lado del banco |
+| `.15` | timeout donde la transferencia **no** se aplicó |
+| `.16` | cuenta de destino inválida (terminal, cacheado por idempotency key) |
+| `.50` | éxito garantizado (útil para reintentar de forma determinística después de una falla forzada) |
 
-So `1500.99` forces a high-risk withdrawal that lands in manual authorization, and `1500.50` forces a clean
-bank transfer once that withdrawal reaches `AUTHORIZED`. Both tables read the same two digits, so one amount
-can only force one of the two legs — the other stays random. Automated tests use
-`TestRiskService`/`TestBankService` (instant and fully controllable) under the `test` profile instead of these
-mocks.
+Entonces `1500.99` fuerza un retiro de riesgo alto que cae en autorización manual, y `1500.50` fuerza una
+transferencia bancaria limpia una vez que ese retiro llega a `AUTHORIZED`. Las dos tablas leen los mismos
+dos dígitos, así que un monto solo puede forzar una de las dos piernas — la otra queda aleatoria. Los tests
+automatizados usan `TestRiskService`/`TestBankService` (instantáneos y totalmente controlables) bajo el
+perfil `test`, en vez de estos mocks.
 
-### A full run, end to end, to `EXECUTED`
+### Una corrida completa, de punta a punta, hasta `EXECUTED`
 
-`.96` forces low risk, which skips manual authorization entirely, so one POST is enough to watch a withdrawal
-go all the way through without calling anything else:
+`.96` fuerza riesgo bajo, que se salta la autorización manual por completo, así que un solo POST alcanza
+para ver un retiro llegar hasta el final sin llamar nada más:
 
 ```bash
-# 1. create it — forced LOW risk
+# 1. crearlo — riesgo LOW forzado
 curl -s -X POST http://localhost:8080/api/withdrawals \
   -H "Content-Type: application/json" \
   -d '{
@@ -214,72 +219,75 @@ curl -s -X POST http://localhost:8080/api/withdrawals \
     "amount": 2500.96
   }'
 
-# 2. ~1-3s later the risk poller has evaluated it: LOW risk, so it is already AUTHORIZED
+# 2. ~1-3s después el poller de riesgo ya lo evaluó: riesgo LOW, así que ya está AUTHORIZED
 curl -s http://localhost:8080/api/withdrawals/<withdrawal-id>
 
-# 3. no further call needed — the transfer poller picks up AUTHORIZED rows on its next tick,
-#    so the same GET shows PROCESSING_TRANSFER and then, after the bank's 3-10s, EXECUTED
-#    with the bank reference under "transfer"
+# 3. no hace falta ninguna llamada más — el poller de transferencia toma las filas AUTHORIZED en
+#    su próximo tick, así que el mismo GET va a mostrar PROCESSING_TRANSFER y después, tras los
+#    3-10s del banco, EXECUTED con la referencia bancaria en "transfer"
 curl -s http://localhost:8080/api/withdrawals/<withdrawal-id>
 ```
 
-The bank leg here is the random one (`96` is not a bank forcing digit), so roughly nine out of ten runs end in
-`EXECUTED`; the rest exercise the error and timeout paths, which is the point of leaving it random. To force a
-specific bank outcome instead, create the withdrawal with a `.13`/`.14`/`.15`/`.16` amount — risk is then the
-random leg, so authorize it by hand if it lands in `PENDING_AUTHORIZATION`.
+Acá la pierna del banco es la aleatoria (`96` no es un dígito de forzado del banco), así que más o menos
+nueve de cada diez corridas terminan en `EXECUTED`; el resto ejercita los caminos de error y timeout, que
+es justo el punto de dejarlo aleatorio. Para forzar un desenlace de banco específico en cambio, creá el
+retiro con un monto `.13`/`.14`/`.15`/`.16` — ahí el riesgo queda como la pierna aleatoria, así que
+autorizalo a mano si cae en `PENDING_AUTHORIZATION`.
 
-## Endpoints available today
+## Endpoints disponibles hoy
 
-| Method | Path | Notes |
+| Método | Path | Notas |
 | --- | --- | --- |
-| `POST` | `/api/withdrawals` | Reserves balance atomically and creates the withdrawal in `EVALUATING_RISK`. `409 INSUFFICIENT_BALANCE`, `404 NOT_FOUND`, `400 VALIDATION_ERROR`. |
-| `GET` | `/api/withdrawals` | Paged search for the backoffice grid. See the query params below. |
-| `GET` | `/api/withdrawals/{id}` | Full detail plus the transfer attempt (status, bank reference, attempt count, last error, resolved at) when one exists, and the full audit trail (`history`: previous/new status, actor, timestamp for every transition). `404 NOT_FOUND`. |
-| `POST` | `/api/withdrawals/{id}/authorize` | Requires header `X-Operator-Id`. Only valid from `PENDING_AUTHORIZATION`. |
-| `POST` | `/api/withdrawals/{id}/reject` | Requires header `X-Operator-Id`. Releases the reserved balance in the same transaction. |
-| `POST` | `/api/withdrawals/{id}/retry` | Requires header `X-Operator-Id`. Only valid from `RETRYABLE_ERROR`; puts it back in `AUTHORIZED` so the transfer poller retries with the same idempotency key (the reserve was never released). |
-| `POST` | `/api/withdrawals/{id}/resolve-manual-review` | Requires header `X-Operator-Id`. Only valid from `MANUAL_REVIEW` (reconciliation gave up asking the bank); closes it to `FINAL_ERROR` and releases the reserved balance. |
-| `GET` | `/api/accounts` | Seeded accounts with balance and reserved balance. Convenience for manual testing and the UI's account picker, not part of the evaluated domain. |
+| `POST` | `/api/withdrawals` | Reserva el saldo de forma atómica y crea el retiro en `EVALUATING_RISK`. `409 INSUFFICIENT_BALANCE`, `404 NOT_FOUND`, `400 VALIDATION_ERROR`. |
+| `GET` | `/api/withdrawals` | Búsqueda paginada para la grilla del backoffice. Ver los query params abajo. |
+| `GET` | `/api/withdrawals/{id}` | Detalle completo más el intento de transferencia (estado, referencia bancaria, cantidad de intentos, último error, resuelto en) cuando existe uno, y el historial de auditoría completo (`history`: estado previo/nuevo, actor, timestamp de cada transición). `404 NOT_FOUND`. |
+| `POST` | `/api/withdrawals/{id}/authorize` | Requiere el header `X-Operator-Id`. Solo válido desde `PENDING_AUTHORIZATION`. |
+| `POST` | `/api/withdrawals/{id}/reject` | Requiere el header `X-Operator-Id`. Libera el saldo reservado en la misma transacción. |
+| `POST` | `/api/withdrawals/{id}/retry` | Requiere el header `X-Operator-Id`. Solo válido desde `RETRYABLE_ERROR`; lo devuelve a `AUTHORIZED` para que el poller de transferencia reintente con la misma idempotency key (la reserva nunca se liberó). |
+| `POST` | `/api/withdrawals/{id}/resolve-manual-review` | Requiere el header `X-Operator-Id`. Solo válido desde `MANUAL_REVIEW` (la reconciliación se rindió preguntándole al banco); lo cierra a `FINAL_ERROR` y libera el saldo reservado. |
+| `GET` | `/api/accounts` | Cuentas sembradas con balance y saldo reservado. Comodidad para testing manual y el selector de cuentas de la UI, no es parte del dominio evaluado. |
 
-Query params for `GET /api/withdrawals`, all optional and combinable:
+Query params de `GET /api/withdrawals`, todos opcionales y combinables:
 
-| Param | Meaning |
+| Param | Significado |
 | --- | --- |
-| `status` | Exact match on one `WithdrawalStatus` (e.g. `PENDING_AUTHORIZATION`). |
-| `dateFrom` / `dateTo` | ISO-8601 instants (`2026-08-10T00:00:00Z`), inclusive, matched against `createdAt`. |
-| `search` | Partial match on the destination CBU, or an exact account id when the term parses as a UUID. |
-| `page` / `size` / `sort` | Spring's standard pagination. Defaults: `size=20`, `sort=createdAt` ascending; e.g. `sort=createdAt,desc`. |
+| `status` | Match exacto contra un `WithdrawalStatus` (ej. `PENDING_AUTHORIZATION`). |
+| `dateFrom` / `dateTo` | Instantes ISO-8601 (`2026-08-10T00:00:00Z`), inclusive, matcheados contra `createdAt`. |
+| `search` | Match parcial sobre el CBU de destino, o un id de cuenta exacto cuando el término parsea como UUID. |
+| `page` / `size` / `sort` | Paginación estándar de Spring. Defaults: `size=20`, `sort=createdAt` ascendente; ej. `sort=createdAt,desc`. |
 
-The four operator actions return `409` when the withdrawal is no longer in the expected state
-(`INVALID_TRANSITION`) or when two operators race for the same withdrawal and optimistic locking rejects the
-loser (`CONFLICT`); the response body includes the real current status and who set it.
+Las cuatro acciones de operador devuelven `409` cuando el retiro ya no está en el estado esperado
+(`INVALID_TRANSITION`) o cuando dos operadores compiten por el mismo retiro y el locking optimista rechaza
+al perdedor (`CONFLICT`); el cuerpo de la respuesta incluye el estado real actual y quién lo actualizó.
 
-## Design decisions
+## Decisiones de diseño
 
-The reasoning behind the data model, the concurrency strategy (atomic reservation, `SKIP LOCKED` pollers,
-optimistic locking) and the trade-offs taken is in [`DECISIONS.md`](DECISIONS.md) — this file only covers how
-to run the project.
+El razonamiento detrás del modelo de datos, la estrategia de concurrencia (reserva atómica, pollers con
+`SKIP LOCKED`, locking optimista) y los trade-offs tomados está en [`DECISIONS.md`](DECISIONS.md) — este
+archivo solo cubre cómo correr el proyecto.
 
-## Project status
+## Estado del proyecto
 
-Active development. The backend flow is complete end to end and runs for real under `docker compose up` with
-two instances: a withdrawal goes from creation through risk evaluation, manual authorization when needed,
-bank transfer and reconciliation of ambiguous timeouts, all the way to `EXECUTED` (or a terminal/retryable
-error), without any manual step beyond the operator decisions. Built so far: data model and migrations,
-external service mocks (with their idempotency ground truth persisted in Postgres, shared across instances —
-see `DECISIONS.md` section 8), atomic balance reservation and withdrawal creation, the three `SKIP LOCKED`
-pollers (risk evaluation with its fail-safe, transfer execution with its claim/call/apply split and
-client-side timeout, reconciliation with its grace period), authorize/reject/retry/resolve-manual-review
-with optimistic locking, the query endpoints backing the backoffice grid, and the two-instance
-`docker-compose.yml`.
+En desarrollo activo. El flujo de backend está completo de punta a punta y corre de verdad bajo
+`docker compose up` con dos instancias: un retiro va desde su creación, pasando por evaluación de riesgo,
+autorización manual cuando hace falta, transferencia bancaria y reconciliación de timeouts ambiguos, hasta
+`EXECUTED` (o un error terminal/reintentable), sin ningún paso manual más allá de las decisiones del
+operador. Construido hasta ahora: modelo de datos y migraciones, mocks de servicios externos (con su verdad
+de fondo de idempotencia persistida en Postgres, compartida entre instancias — ver `DECISIONS.md` sección
+8), reserva atómica de saldo y creación de retiros, los tres pollers con `SKIP LOCKED` (evaluación de riesgo
+con su fail-safe, ejecución de transferencia con su split claim/call/apply y timeout del lado del cliente,
+reconciliación con su grace period), autorizar/rechazar/reintentar/resolver revisión manual con locking
+optimista, los endpoints de consulta que sostienen la grilla del backoffice, y el `docker-compose.yml` de
+dos instancias.
 
-The frontend (`frontend/src/`) is wired to the real API: a filterable/paginated grid, a detail panel with
-the full audit trail, the operator actions (authorize/reject/retry/resolve manual review, gated behind an
-operator id header), a create-withdrawal form with client-side validation matching the backend's, polling
-so background poller-driven transitions show up without a manual refresh, and explicit handling of 409
-conflicts (C4) showing who resolved it first instead of a bare error. Verified against the real stack in a
-browser (screenshots + a scripted click-through), not just against `curl`. One deliberate simplification:
-status updates are polled (`refetchInterval`, every 4s) instead of pushed via SSE/WebSockets — the
-difference is UX/efficiency, not correctness (the data is never stale for more than one poll interval, and
-every mutation also invalidates the relevant queries immediately), and polling doesn't add a persistent
-connection to manage across two backend instances.
+El frontend (`frontend/src/`) está conectado a la API real: una grilla filtrable y paginada, un panel de
+detalle con el historial de auditoría completo, las acciones de operador (autorizar/rechazar/reintentar/
+resolver revisión manual, bloqueadas detrás de un header de id de operador), un formulario de alta de
+retiro con validación del lado del cliente que coincide con la del backend, polling para que las
+transiciones que dispara el background aparezcan sin refrescar a mano, y manejo explícito de conflictos 409
+(C4) mostrando quién lo resolvió primero en vez de un error genérico. Verificado contra el stack real en un
+navegador (capturas + un recorrido de clicks scripteado), no solo contra `curl`. Una simplificación
+deliberada: los cambios de estado se consultan por polling (`refetchInterval`, cada 4s) en vez de empujarse
+por SSE/WebSockets — la diferencia es de UX/eficiencia, no de correctitud (el dato nunca queda desactualizado
+por más de un intervalo de polling, y cada mutación además invalida las queries relevantes al toque), y el
+polling no agrega una conexión persistente que mantener entre las dos instancias del backend.
