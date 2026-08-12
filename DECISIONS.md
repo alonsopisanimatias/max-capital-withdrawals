@@ -9,29 +9,19 @@ así**.
 
 ---
 
-## 0. Estado de implementación
+## 0. Resumen ejecutivo
 
-El documento describe únicamente lo que el código hace hoy. Lo que todavía no está
-implementado tiene su sección marcada como pendiente en vez de omitirse, para que la
-estructura de lectura sea la misma cuando se complete.
+Una fila por condición: mecanismo y test que la verifica. El desarrollo completo de cada una,
+con las alternativas descartadas, está en las secciones 3 a 8.
 
-| Pieza | Estado |
-|---|---|
-| Modelo de datos + migraciones Flyway | Implementado |
-| Mocks de riesgo y banco (con semántica de idempotencia) | Implementado |
-| Reserva atómica de saldo (C5) | Implementado + test de concurrencia |
-| Creación de retiro (`POST /api/withdrawals`) | Implementado |
-| Poller de evaluación de riesgo (C2 / C3) | Implementado + test de concurrencia |
-| Autorizar / rechazar / reintentar / resolver revisión manual, con locking optimista (C4) | Implementado + test de concurrencia |
-| Poller de ejecución de transferencia (C1) | Implementado + tests de los 4 desenlaces del banco |
-| Poller de reconciliación post-timeout (C6) | Implementado + tests de los 2 timeouts (aplicado / no aplicado) y del escalamiento a `MANUAL_REVIEW` con salida por operador |
-| Listado con filtros (`GET /api/withdrawals`) + detalle + cuentas | Implementado |
-| Frontend de backoffice (grilla, filtros, detalle con historial, autorizar/rechazar/reintentar/resolver, alta de retiro, polling, manejo de 409) | Implementado y verificado en navegador contra el stack real |
-| docker-compose multi-instancia | Implementado y validado end-to-end (`backend-1`/`backend-2`/`frontend` + Postgres) |
-
-Los estados `PROCESSING_TRANSFER`, `EXECUTED`, `FINAL_ERROR`, `RETRYABLE_ERROR` y
-`MANUAL_REVIEW` del enum `WithdrawalStatus`, y la tabla `transfer` completa, ya existen en el
-modelo porque el diseño de la máquina de estados se cerró antes de escribir código.
+| Condición | Mecanismo (una línea) | Test que la verifica |
+|---|---|---|
+| **C1** — la llamada lenta al banco no bloquea al operador | `WithdrawalService` nunca tiene una referencia a `BankService`; un poller la ejecuta en otro hilo, fuera de la transacción del endpoint | `TransferExecutionPollerTest` |
+| **C2** — el riesgo se evalúa una sola vez, de forma asíncrona | Poller cuyo claim y escritura del resultado ocurren en la misma transacción `REQUIRES_NEW`; fail-safe a `PENDING_AUTHORIZATION` si el servicio de riesgo falla | `RiskEvaluationPollerTest` |
+| **C3** — con 2+ instancias, ningún retiro se procesa dos veces ni queda sin procesar | `SELECT ... FOR UPDATE SKIP LOCKED`: la tabla se comporta como una cola multi-consumidor, sin coordinador externo | los tests de concurrencia dentro de `RiskEvaluationPollerTest`, `TransferExecutionPollerTest` y `ReconciliationPollerTest` |
+| **C4** — dos operadores sobre el mismo retiro: gana el primero, el otro se entera | Precondición de estado + `@Version` (optimistic locking) → 409 con el estado real y quién lo actualizó | `WithdrawalServiceAuthorizationTest` |
+| **C5** — la suma de retiros vivos nunca excede el saldo disponible | UPDATE condicional atómico (`WHERE (balance - reserved_balance) >= :amount`), sin locks aplicativos | `AccountReservationConcurrencyTest` |
+| **C6** — un retiro nunca genera dos transferencias reales | Idempotency key por retiro + compromiso persistido antes de llamar al banco + UPDATE condicional guardado por `attempt_count` + reconciliación que **consulta** en vez de reintentar a ciegas | `ReconciliationPollerTest` (más los tests de timeout de `TransferExecutionPollerTest`) |
 
 ---
 
@@ -40,7 +30,15 @@ modelo porque el diseño de la máquina de estados se cerró antes de escribir c
 Las instrucciones detalladas están en `README.md`. En resumen: `docker compose up -d` levanta
 Postgres, Flyway aplica migraciones y seed al arrancar el backend (`backend/gradlew bootRun`),
 y `backend/gradlew test` corre la suite —requiere Docker corriendo, porque los tests de
-integración usan Testcontainers con un Postgres real (ver sección 11).
+integración usan Testcontainers con un Postgres real (ver sección 13).
+
+**Dos instancias idénticas, no una detrás de un balanceador.** El punto de C3 es la corrección
+del procesamiento en background entre instancias, no la distribución de tráfico HTTP — así que
+`backend-1`/`backend-2` quedan accesibles cada una en su propio puerto para la demo, en vez de
+esconderlas detrás de nginx: eso deja ver en los logs (tagueados por `INSTANCE_ID`) que cada una
+reclama filas disjuntas vía `SKIP LOCKED`, algo que un balanceador ocultaría. `nginx` sí sirve el
+frontend estático y proxea `/api` a `backend-1` — ahí no hay nada que demostrar entre instancias,
+así que una sola basta.
 
 ---
 
@@ -76,6 +74,13 @@ C5 sin que nada avise.
 `account` tampoco tiene columna `version`: los escritores concurrentes ya pasan por UPDATE
 condicionales que Postgres serializa a nivel de fila. Un `@Version` sin usar sería peso muerto
 y además invitaría a mutar la entidad, que es justo lo que se quiere evitar.
+
+**La reserva no es exclusiva de los retiros** (el enunciado lo pide explícitamente: en el sistema
+real la usarían también otras operaciones, como compra de acciones o de dólares). Por eso
+`tryReserve`/`release`/`settle` (sección 7) están parametrizadas solo por `accountId` y `amount`
+— no reciben ni conocen `withdrawalId` — así que cualquier otra operación que necesite apartar
+saldo de una cuenta puede reusar las mismas tres queries sin que `AccountRepository` sepa que
+existen los retiros.
 
 ### 2.2 `withdrawal`
 
@@ -119,31 +124,18 @@ reconciliación tiene que resolver contra el banco.
 
 ### 2.4 `withdrawal_status_history`
 
-Append-only: `(withdrawal_id, previous_status, new_status, actor, occurred_at)`. Sin setters en
-la entidad, todas las columnas `updatable = false`.
+Append-only: `(withdrawal_id, previous_status, new_status, actor, occurred_at)`, sin setters,
+todas las columnas `updatable = false`. **No estaba pedida en el enunciado** — se agregó porque
+`withdrawal.updated_by` solo dice quién tocó el retiro por última vez, y un broker regulado por
+CNV necesita poder reconstruir la secuencia completa de decisiones sobre un retiro sin depender
+de logs (que rotan y no son transaccionales con el cambio de estado). Costo bajo: un insert por
+transición, en la misma transacción (`WithdrawalService.recordTransition` y equivalentes en
+`TransferOutcomeService`/`RiskEvaluationPoller`). Expuesta en `GET /api/withdrawals/{id}` como
+`WithdrawalDetailResponse.history`.
 
-**No estaba pedida en el enunciado.** Se agregó porque el dominio es un broker regulado por
-CNV: `withdrawal.updated_by` solo dice quién tocó el retiro por última vez, y eso no permite
-responder la pregunta que un área de compliance hace de verdad — "mostrame la secuencia
-completa de decisiones sobre este retiro: quién lo creó, qué dijo el motor de riesgo, quién lo
-autorizó, cuántos intentos hubo contra el banco y cuándo". Reconstruir eso desde los logs de la
-aplicación no es una respuesta aceptable en un dominio regulado: los logs rotan y no son
-transaccionales con el cambio de estado.
-
-El costo es bajo y acotado (un insert por transición, en la misma transacción que la
-transición, vía `WithdrawalService.recordTransition` y el equivalente en `TransferOutcomeService`
-y `RiskEvaluationPoller`), así que entra dentro del criterio de "no agregar features no pedidas":
-no es una feature de producto, es la tabla que el dominio exige.
-
-`GET /api/withdrawals/{id}` la expone: `WithdrawalDetailResponse.history` es una lista de
-`HistoryEntry` (`previousStatus`, `newStatus`, `actor`, `occurredAt`), leída con
-`WithdrawalStatusHistoryRepository.findByWithdrawalIdOrderByOccurredAt` y ordenada de más viejo a
-más nuevo. Sin esto la tabla existía pero no había forma de que un operador o compliance la
-consultaran sin ir directo a la base — la trazabilidad quedaba en el modelo, no en el producto.
-
-*Alternativa descartada*: Hibernate Envers. Da versionado automático de toda la entidad, pero
-audita cambios de campos, no decisiones de negocio, y agrega una dependencia y un esquema
-paralelo para obtener menos información de la que dan cinco columnas escritas a mano.
+*Alternativa descartada*: Hibernate Envers — audita cambios de campos, no decisiones de negocio,
+y agrega una dependencia y un esquema paralelo por menos información que cinco columnas escritas
+a mano.
 
 ### 2.5 Máquina de estados (`WithdrawalStatus`)
 
@@ -184,16 +176,12 @@ Todas las transiciones del diagrama están implementadas: `EVALUATING_RISK` → 
 no es un final sin salida: `POST /{id}/resolve-manual-review` → `WithdrawalService.resolveManualReview`
 lo cierra a `FINAL_ERROR` liberando la reserva (sección 8).
 
-Dos decisiones de la máquina de estados que vale la pena defender:
-
-1. **`PROCESSING_TRANSFER` es un estado explícito**, no un flag. Sin él no hay forma de
-   distinguir "autorizado y esperando que alguien lo tome" de "hay una llamada al banco en
-   vuelo ahora mismo", y esa distinción es exactamente lo que impide que dos instancias tomen
-   el mismo retiro (C3) y lo que le da a la reconciliación algo concreto que buscar (C6).
-2. **`RETRYABLE_ERROR` y `FINAL_ERROR` son estados distintos** porque el banco distingue dos
-   fallos con semántica opuesta: cuenta inválida es terminal (reintentar es inútil y además
-   está cacheado del lado del banco), error interno es transitorio (reintentar es lo correcto).
-   Colapsarlos en un solo `FAILED` obligaría al operador a adivinar cuál de los dos es.
+Dos decisiones de la máquina de estados que se desarrollan en detalle donde importan:
+**`PROCESSING_TRANSFER` es un estado explícito**, no un flag — es lo que impide que dos
+instancias tomen el mismo retiro (C3) y le da a la reconciliación algo concreto que buscar (C6,
+sección 8). **`RETRYABLE_ERROR` y `FINAL_ERROR` son estados distintos** porque el banco
+distingue cuenta inválida (terminal) de error interno (transitorio) — colapsarlos obligaría al
+operador a adivinar cuál es cuál (sección 3).
 
 ---
 
@@ -249,20 +237,12 @@ están todos bloqueados esperando un turno en `bankCallExecutor`, que nunca se l
 más los dispara. Son dos responsabilidades con dos ritmos distintos —despachar es instantáneo,
 llamar al banco tarda 3-10s— y cada una necesita su propio techo.
 
-Tres decisiones más, dentro de eso:
-
-- **Ninguno de los dos es el pool de scheduling.** Si la fase B corriera ahí, ocho llamadas de
-  10s vaciarían los 4 hilos de `spring.task.scheduling.pool.size` y frenarían también al poller
-  de riesgo y al de reconciliación. El scheduler tiene que quedar libre para seguir tomando
-  lotes; es un pool para disparar trabajo, no para esperarlo.
-- **Ninguno es un executor sin cota.** Un pool ilimitado bajo un burst de autorizaciones es cómo
-  se termina con un número descontrolado de llamadas concurrentes contra el banco. 8 hilos en
-  `bankCallExecutor` son un techo explícito de concurrencia contra el proveedor externo.
-- **El dimensionamiento de `hikari.maximum-pool-size: 15` está atado a `bankCallExecutor` (8),
-  no al dispatcher.** El dispatcher toca la base solo al principio (dos lecturas) y al final (la
-  fase C), nunca durante el `join()`, así que aunque tenga hasta 15 hilos no retiene 15
-  conexiones a la vez. `bankCallExecutor` es el que fija el piso de conexiones que hacen falta
-  aparte del tráfico HTTP normal y los hilos de scheduling.
+Tres decisiones más, dentro de eso: ninguno de los dos pools es el de scheduling (si la fase B
+corriera ahí, vaciaría los 4 hilos de `spring.task.scheduling.pool.size` y frenaría también a los
+otros pollers); ninguno es un executor sin cota (8 hilos en `bankCallExecutor` son el techo
+explícito de concurrencia contra el banco); y `hikari.maximum-pool-size: 15` está dimensionado
+contra `bankCallExecutor` (8), no contra el dispatcher, porque este último solo toca la base al
+principio y al final, nunca durante el `join()`.
 
 **Timeout duro del lado del cliente** (`callBankWithTimeout`): el mock tarda 3-10s, pero un banco
 real puede no contestar nunca, y un worker de `bankCallExecutor` bloqueado para siempre es un
@@ -275,12 +255,9 @@ CompletableFuture.supplyAsync(
 ).orTimeout(bankCallTimeoutSeconds, TimeUnit.SECONDS);
 ```
 
-El executor explícito como segundo argumento no es cosmético: la variante de un solo argumento
-de `supplyAsync` corre sobre `ForkJoinPool.commonPool()`, que no es ninguno de los dos pools que
-este código controla — en un contenedor de pocos CPUs ese pool puede tener paralelismo 1 (las
-llamadas se serializan detrás del timeout) o directamente no existir como tal, cayendo en un
-executor sin cota por tarea, que es exactamente lo que un pool dedicado y acotado existe para
-evitar.
+El executor explícito como segundo argumento no es cosmético: sin él, `supplyAsync` corre sobre
+`ForkJoinPool.commonPool()`, fuera de los dos pools que este código controla y con paralelismo
+potencialmente 1 en un contenedor de pocos CPUs.
 
 `bank-call-timeout-seconds: 15`. Las excepciones chequeadas del banco se envuelven en
 `CompletionException` dentro del supplier y se desenvuelven en el `catch` de `join()`, para que
@@ -339,16 +316,11 @@ esperando en vez de pasar.
 
 **Alternativas descartadas**:
 
-- *Llamar al banco en el request, aunque sea con un timeout corto*: es la alternativa que hay que
-  descartar con argumento porque suena razonable. No alcanza. Con un timeout de 2s el hilo del
-  contenedor y su conexión quedan tomados esos 2s por cada operador igual, y lo que satura Tomcat
-  bajo un burst de autorizaciones es la ocupación, no la lentitud en sí. Peor: si el proceso se
-  reinicia con la llamada en vuelo, no queda nada que continúe el trabajo — el retiro quedó
-  `AUTHORIZED` en la base y nadie lo va a retomar, o hay una transferencia aplicada en el banco de
-  la que el sistema no tiene registro. El poller sobrevive al reinicio porque el trabajo pendiente
-  está en una tabla, no en un hilo. Y el timeout corto tampoco elimina la ambigüedad: sigue
-  habiendo un caso en el que no se sabe si el banco aplicó, solo que ahora ocurre en el hilo HTTP
-  y con un operador mirando la pantalla.
+- *Llamar al banco en el request, con un timeout corto*: no alcanza. El hilo y la conexión quedan
+  tomados igual bajo un burst de autorizaciones, y si el proceso se reinicia con la llamada en
+  vuelo no queda nada que continúe el trabajo — el poller sobrevive al reinicio porque el trabajo
+  pendiente está en una tabla, no en un hilo. La ambigüedad del timeout tampoco desaparece, solo
+  se muda al hilo HTTP con un operador mirando la pantalla.
 - *`@Async` disparado desde el endpoint*: responde rápido, pero la unidad de trabajo vive en la
   cola en memoria del executor. Un reinicio la pierde y con 2 instancias no hay coordinación
   alguna — mismo argumento que en C2 (sección 4), y acá el trabajo perdido mueve plata.
@@ -459,18 +431,9 @@ inyectado**, no sobre `this`. Si se invocara internamente, el proxy de Spring no
 no habría transacción real, y el test podría pasar sin probar nada.
 
 **Evidencia real, no solo del test**: con `docker compose up` corriendo `backend-1` y
-`backend-2` de verdad, 6 retiros creados de una sola vez terminaron repartidos así (logs
-reales, filtrados por `claimed`):
-
-```
-[backend-1] risk evaluation claimed 1 withdrawal(s): [d0fd53d4-...]
-[backend-2] risk evaluation claimed 5 withdrawal(s): [64ff6f88-..., ffc9ccdf-..., 68f86a04-..., 776cc9ef-..., 63cf4760-...]
-[backend-1] transfer execution claimed 5 withdrawal(s): [64ff6f88-..., ffc9ccdf-..., 68f86a04-..., 776cc9ef-..., 63cf4760-...]
-[backend-2] transfer execution claimed 1 withdrawal(s): [d0fd53d4-...]
-```
-
-Cero superposición de IDs entre instancias en cada etapa, y los 6 retiros llegaron a `EXECUTED`
-sin ninguna intervención manual más allá del `POST` inicial.
+`backend-2` de verdad, 6 retiros creados de una sola vez se repartieron sin ninguna superposición
+de IDs entre instancias en ninguna etapa (verificado en los logs, filtrados por `claimed`), y los
+6 llegaron a `EXECUTED` sin intervención manual más allá del `POST` inicial.
 
 **Alternativas descartadas**:
 
@@ -685,20 +648,19 @@ por acá, y **todos chequean `rows == 0` y se van sin hacer nada** si el UPDATE 
 fila. `expectedAttemptCount` es el `attempt_count` que `processOne` leyó de la fila `transfer`
 **antes** de llamar al banco (sección 3), no el actual al momento de aplicar el resultado.
 
-La carrera concreta que ataja, y por qué el `status = 'PROCESSING_TRANSFER'` solo no alcanza: el
-intento 1 hace timeout de cliente a los 15s pero la llamada real sigue viva contra el banco.
-Mientras tanto la reconciliación consulta, ve `NOT_FOUND`, y `resetForRetryAfterReconciliation`
-devuelve el retiro a `AUTHORIZED` — el `TransferExecutionPoller` lo reclama de nuevo, incrementa
-`attempt_count` a 2 y el retiro vuelve a `PROCESSING_TRANSFER`, ahora para el intento 2. Si en ese
-momento llega la respuesta tardía del intento 1 (el banco sí lo había aplicado) y llama a
-`applySuccess`, un guard que solo mirara `status = 'PROCESSING_TRANSFER'` **matchearía igual** —el
-retiro está en ese estado, solo que por el intento 2— y aplicaría el resultado del intento 1
-encima del trabajo en curso del intento 2: doble débito o un `bankReference` que no corresponde al
-intento que realmente está resolviéndose. El chequeo de `attempt_count` es lo que distingue "esta
-fila sigue en el estado que autoriza mi escritura" de "esta fila volvió a este mismo estado por
-otro motivo". El caso más simple —fase B tardía llegando después de que la reconciliación ya
-resolvió el mismo intento a `EXECUTED`— también lo cubre, porque ahí ni siquiera el `status`
-matchea.
+La carrera concreta que ataja, y por qué el `status = 'PROCESSING_TRANSFER'` solo no alcanza:
+
+1. El intento 1 hace timeout de cliente a los 15s, pero la llamada real sigue viva contra el banco.
+2. Pasa el grace period; la reconciliación consulta, ve `NOT_FOUND` y devuelve el retiro a `AUTHORIZED`.
+3. El `TransferExecutionPoller` lo reclama de nuevo: `attempt_count` sube a 2, vuelve a `PROCESSING_TRANSFER`.
+4. Llega la respuesta tardía del intento 1 (sí se había aplicado) y dispara `applySuccess`.
+5. Un guard que solo mirara `status` **matchearía igual** — aplicaría el resultado del intento 1
+   encima del intento 2 en curso: doble débito, o una `bankReference` que no corresponde.
+
+`attempt_count` es lo que distingue "esta fila sigue en el estado que autoriza mi escritura" de
+"volvió a este estado por otro motivo, en otro intento" — incluso el caso más simple (fase B
+tardía llegando después de que la reconciliación ya resolvió el mismo intento) queda cubierto,
+porque ahí ni el `status` matchea.
 
 Que el chequeo de `rows == 0` esté **antes** de `settle`/`release` y no después no es casual: el
 efecto sobre el saldo es precisamente el que no se puede repetir. `COALESCE(:transferId,
@@ -752,14 +714,14 @@ que salir del loop automático y no quedarse en él indefinidamente.
 camino de salida en el código — un operador podía ver el retiro en esa cola pero no había endpoint
 que le permitiera cerrarlo, y la reserva de saldo quedaba tomada indefinidamente. Verificado por
 `ReconciliationPollerTest.repeatedReconciliationLookupFailuresEscalateToManualReviewWithOperatorExit`
-(sección 11), que fuerza los 5 fallos de lookup, confirma el escalamiento y después llama
+(sección 13), que fuerza los 5 fallos de lookup, confirma el escalamiento y después llama
 `resolveManualReview` para comprobar que la reserva se libera.
 
 El grace period (`grace-period-seconds: 30`) tiene que ser mayor que el timeout de cliente (15s),
 si no la reconciliación empezaría a preguntar por transferencias que todavía están legítimamente
 en vuelo. La comparación se hace con `now()` de Postgres y no con el reloj de la JVM: con 2+
 instancias hay clock skew, y lo que decide qué fila es elegible tiene que salir de un solo reloj
-(sección 12).
+(sección 14).
 
 **El lock de la reconciliación es sobre `withdrawal`, no sobre `transfer`.**
 `lockNextBatchForReconciliation` joinea `transfer` para filtrar por `requested_at`, pero lockea con
@@ -808,7 +770,7 @@ instancias, vía `INSERT ... ON CONFLICT DO NOTHING`.
 *Supuesto explícito*: el enunciado no dice que el banco ofrezca una consulta por idempotency
 key. Se asumió porque sin ella un timeout es irresoluble — cualquier decisión (reintentar o
 dar por fallido) sería adivinar, y una de las dos ramas duplica plata. Es el supuesto más
-fuerte del diseño y está declarado como tal en la sección 12.
+fuerte del diseño y está declarado como tal en la sección 14.
 
 **Verificación de esa semántica**: `BankServiceMockTest` cubre los cinco casos (error interno
 no cacheado y reintentable, cuenta inválida terminal y cacheada, timeout aplicado visible como
@@ -837,14 +799,10 @@ para no dormir 30 segundos; la lógica ejercitada es exactamente la de producci�
 
 **Alternativas descartadas**:
 
-- *Reintentar automáticamente después de un timeout, sin consultar antes*: es el procedimiento
-  exacto para generar una transferencia doble. Un timeout significa "no sé", y una parte de las
-  veces significa "el banco aplicó y la respuesta se perdió"; un reintento ciego en ese caso manda
-  una segunda transferencia real. La única razón por la que acá no duplicaría es que el mock
-  cachea por idempotency key — y apoyarse en eso sería confundir la garantía del banco con la del
-  propio sistema: si el banco no cacheara, o cacheara por menos tiempo del que tarda el reintento,
-  sale la plata dos veces. El diseño no depende de la buena voluntad del proveedor: pregunta
-  primero.
+- *Reintentar automáticamente sin consultar antes*: genera una transferencia doble cada vez que
+  el timeout en realidad sí se aplicó. Que acá no duplique depende de que el mock cachee por
+  idempotency key — apoyarse en eso confundiría la garantía del banco con la del propio sistema.
+  El diseño no depende de la buena voluntad del proveedor: pregunta primero.
 - *Dar el timeout por fallido y liberar la reserva*: la rama opuesta, y es peor. Si el banco sí
   aplicó, se libera saldo de un retiro que ya se pagó y la cuenta puede volver a comprometer plata
   que no tiene. Descartado por el mismo motivo: es adivinar sobre un resultado que se puede
@@ -865,10 +823,79 @@ para no dormir 30 segundos; la lógica ejercitada es exactamente la de producci�
 
 ---
 
-## 9. Por qué Postgres y no MongoDB
+## 9. Frontend — decisiones que no están cubiertas por C1-C6
 
-MongoDB es la base con la que tengo más horas de vuelo, y aun así este problema pide Postgres.
-La elección se hizo por los requisitos, no por comodidad:
+Las seis condiciones son del backend; el frontend tiene sus propias decisiones, más chicas pero
+reales.
+
+**Polling, no WebSockets/SSE.** `useWithdrawals`/`useWithdrawal` usan `refetchInterval: 4000`
+(React Query) en vez de una conexión persistente. La mayoría de las transiciones de estado
+pasan server-side, en los pollers de background (riesgo, transferencia, reconciliación), no en
+respuesta a una acción del operador en esa pantalla — así que algo tiene que refrescar la grilla
+sola para que se vean sin que el operador la actualice a mano. Se descartó SSE por la misma razón
+de fondo que C3: con `backend-1`/`backend-2` corriendo detrás de nginx, una conexión `SseEmitter`
+vive en el heap de **una sola** instancia, y el evento que dispara la actualización (un poller
+terminando un tick) puede correr en la otra — el mismo problema de estado en memoria por
+instancia que ya se resolvió del lado del banco mock (sección 8). 4 segundos es una elección de
+UX (suficientemente rápido para sentirse "vivo" sin generar carga real: la tabla filtrada trae
+como mucho unas decenas de filas) y no una condición evaluada, así que no tiene test dedicado.
+
+**El 409 de C4 se muestra con lo que realmente pasó, no como error genérico.**
+`useWithdrawalActions.ts` distingue `error.isConflict` y arma el mensaje con
+`STATUS_LABELS[conflict.currentStatus]` y `actorLabel(conflict.updatedBy)` — "ya está en
+Autorizado (actualizado por operator-juan)" en vez de "409 Conflict". Además invalida las queries
+de `withdrawals` y `withdrawal` en el mismo `onError`, no solo en `onSuccess`: el operador que
+pierde la carrera tiene que ver el estado real al toque, no seguir mirando una fila que ya
+cambió por debajo hasta el próximo tick del polling.
+
+**Ninguna acción hace optimistic update.** Autorizar/rechazar/reintentar/resolver deshabilitan
+el botón mientras `mutation.isPending` y esperan la respuesta del servidor —vía
+`queryClient.invalidateQueries`, no escribiendo el nuevo estado a mano en el cache— antes de
+mostrar el cambio. Es deliberado y no un descuido: C4 existe precisamente porque dos operadores
+pueden estar mirando la misma fila, y un optimistic update le mostraría al que va a perder la
+carrera un "Autorizado" que un instante después el 409 revierte — un parpadeo de éxito falso es
+peor que medio segundo de latencia percibida en una pantalla de backoffice, que no es un chat.
+
+**Carga y vacío, sin tapar la grilla de golpe.** El primer fetch muestra "Cargando retiros...";
+los refetches del polling de 4s no — solo un texto discreto ("Actualizando...") debajo de la
+tabla (`isFetching && !isLoading` en `App.tsx`), para no generar un parpadeo completo cada vez
+que el poller refresca solo. Un filtro sin resultados muestra un estado vacío explícito ("No hay
+retiros que coincidan con los filtros actuales."), nunca una tabla en blanco sin explicación.
+
+**Filtro de fecha en huso horario local.** `localDayBoundaryToIsoInstant` arma el rango con
+`new Date(year, month, day, ...)` en la zona del navegador antes de convertir a ISO/UTC, en vez
+de concatenar `T00:00:00Z` a mano — lo segundo hace que un retiro creado a las 22:00 en Argentina
+caiga fuera del filtro "hoy" para un operador en GMT-3. Sin test dedicado (es lógica de
+formateo, no una condición de negocio), verificado manualmente contra el stack real.
+
+---
+
+## 10. Organización del código
+
+La dirección de dependencias es siempre la misma, en las dos partes del sistema que le hablan al
+dominio: **controller/poller → service → repository**, nunca al revés. `WithdrawalController` y
+cada poller (`RiskEvaluationPoller`, `TransferExecutionPoller`, `ReconciliationPoller`) llaman a
+`WithdrawalService`/`TransferOutcomeService`; ninguno de los dos toca un repositorio
+directamente, y ningún repositorio conoce a un service o a un controller. `GlobalExceptionHandler`
+vive en `web/` junto al controller, no en `domain/`, porque traducir una excepción a un código
+HTTP es una decisión de la capa de transporte, no del dominio — el dominio tira excepciones de
+negocio (`InsufficientBalanceException`, `InvalidTransitionException`) sin saber que hay un HTTP
+del otro lado.
+
+Esto es lo que hace posible, por ejemplo, que `AccountReservationConcurrencyTest` (sección 7)
+pruebe C5 llamando directo a `AccountRepository`, sin levantar un controller ni pasar por
+`WithdrawalService`: la garantía de concurrencia vive en la capa de datos y se puede verificar
+ahí, aislada, sin arrastrar el resto del sistema. Y es lo que permite que los cuatro pollers
+compartan `TransferOutcomeService`/`WithdrawalService` como único punto de escritura sobre
+`withdrawal`/`transfer` — si mañana cambia cómo se decide un `RETRYABLE_ERROR`, hay un lugar
+donde cambiarlo, no cuatro.
+
+---
+
+## 11. Por qué Postgres y no MongoDB
+
+Postgres se eligió por lo que el problema necesita, no por preferencia personal — son cuatro
+razones concretas, todas ligadas a una condición específica:
 
 1. **Transacciones ACID multi-tabla.** Reservar saldo, insertar el retiro y escribir la fila de
    historia tienen que commitear juntos o no commitear (`WithdrawalService.createWithdrawal`).
@@ -897,27 +924,18 @@ numéricos bajo concurrencia, que es el caso canónico de una relacional.
 
 ---
 
-## 10. Por qué Gradle
+## 12. Por qué Gradle
 
-Por familiaridad, no por una ventaja técnica objetiva sobre Maven en este proyecto. No hay
-build multi-módulo, ni tareas custom, ni nada donde el DSL de Gradle rinda de verdad. Prefiero
-decirlo así antes que inventar una justificación técnica que el código no respalda.
-
-Lo único que en este `build.gradle` no es boilerplate son dos workarounds de entorno reales,
-que igual hubieran hecho falta con Maven:
-
-- Un override del BOM de Testcontainers: Spring Boot 3.3.4 fija `testcontainers-core` 1.19.8,
-  que falla al hablar con las versiones actuales de Docker Desktop
-  (`BadRequestException` en `/info`). Se importa `testcontainers-bom:1.21.3`.
-- Forzar `DOCKER_API_VERSION=1.51` en el JVM forkeado de los tests: el daemon de Docker acá
-  exige `MinAPIVersion 1.44`, pero `docker-java` usa un default hardcodeado (1.32) para algunas
-  llamadas internas. Se setea como variable de entorno del proceso de test (no del daemon de
-  Gradle, que ya está arrancado y es poco confiable de modificar) para que aplique a **todas**
-  las llamadas y no solo a algunas.
+Por familiaridad, no por una ventaja técnica objetiva sobre Maven en este proyecto: no hay build
+multi-módulo ni tareas custom donde el DSL de Gradle rinda de verdad. Lo único no-boilerplate en
+`build.gradle` son dos workarounds de entorno reales (que igual hubieran hecho falta con Maven):
+un override del BOM de Testcontainers a `1.21.3` porque la versión que fija Spring Boot 3.3.4
+falla contra Docker Desktop actual, y forzar `DOCKER_API_VERSION=1.51` en el JVM forkeado de los
+tests porque `docker-java` usa un default hardcodeado que el daemon local rechaza.
 
 ---
 
-## 11. Testing
+## 13. Testing
 
 **Criterio**: pocos tests, sobre lo que puede romper plata. No se buscó cobertura amplia; se
 buscó que cada condición crítica con concurrencia tenga un test que la ejercite de verdad.
@@ -925,14 +943,23 @@ buscó que cada condición crítica con concurrencia tenga un test que la ejerci
 | Test | Qué cubre |
 |---|---|
 | `AccountReservationConcurrencyTest` | **C5** — 20 hilos simultáneos contra la misma cuenta; exactamente 16 reservas, 4 rechazos, `reserved <= balance` |
-| `RiskEvaluationPollerTest` | **C2/C3** — auto-autorización LOW, `PENDING_AUTHORIZATION` en HIGH, fail-safe ante fallo del servicio, 2 pollers concurrentes que nunca evalúan dos veces el mismo retiro, y un test dedicado que pasa por el `tick()` real (no `processBatch()` directo) — guarda de regresión para el bug de auto-invocación: ningún otro test de esta clase habría detectado que `self.processBatch()` volviera a ser `this.processBatch()` |
+| `RiskEvaluationPollerTest` | **C2/C3** — auto-autorización LOW, `PENDING_AUTHORIZATION` en HIGH, fail-safe ante fallo del servicio, y 2 pollers concurrentes que nunca evalúan dos veces el mismo retiro (ver nota debajo sobre su guarda de regresión) |
 | `WithdrawalServiceAuthorizationTest` | **C4** — authorize/reject felices, precondición de estado inválido, y la carrera authorize-vs-reject con verificación del saldo reservado final |
-| `TransferExecutionPollerTest` | **C1/C6** — los 4 desenlaces del banco: éxito (settle + `EXECUTED`), cuenta inválida (`FINAL_ERROR` + libera reserva), error interno (`RETRYABLE_ERROR` + reserva intacta), timeout (`AWAITING_RECONCILIATION`, retiro nunca sale de `PROCESSING_TRANSFER`); más **C3** para `lockNextBatchForTransfer` — 12 retiros, 2 pollers concurrentes, `executionCount == 1` para cada uno |
-| `ReconciliationPollerTest` | **C6** — timeout que sí se aplicó resuelto a `EXECUTED`; timeout que no se aplicó, reseteado y reintentado con éxito, verificando `executionCount == 2` (nunca una tercera llamada real al banco); fallas repetidas del lookup de reconciliación escalando a `MANUAL_REVIEW` con salida real vía operador; más **C3** para `lockNextBatchForReconciliation` (`concurrentPollersResolveEachStuckWithdrawalWithoutDoubleApplying`) — 12 retiros stuck, 2 pollers concurrentes. A diferencia de los tests de concurrencia de `RiskEvaluationPollerTest`/`TransferExecutionPollerTest`, acá no se afirma que la consulta al banco corra exactamente una vez: el claim de la reconciliación solo bumpea `requested_at` (no cambia el status), así que una resolución lenta puede legítimamente dejar un retiro elegible de nuevo después de otro grace period — self-healing a propósito, no un bug. Lo que sí es una garantía real, y lo que el test afirma, es que el estado final nunca se aplica dos veces (status `AUTHORIZED`, `transfer` en `PENDING`, reserva intacta en 100.00 para cada uno de los 12), gracias al guard de `transitionFromProcessingTransfer` |
+| `TransferExecutionPollerTest` | **C1/C6** — los 4 desenlaces del banco (éxito, cuenta inválida, error interno, timeout) más **C3** para `lockNextBatchForTransfer`: 12 retiros, 2 pollers concurrentes, `executionCount == 1` para cada uno |
+| `ReconciliationPollerTest` | **C6** — timeout aplicado resuelto a `EXECUTED`; timeout no aplicado, reseteado y reintentado con éxito; fallas repetidas del lookup escalando a `MANUAL_REVIEW` con salida por operador; más **C3** para `lockNextBatchForReconciliation` (ver nota debajo sobre su invariante de concurrencia) |
 | `WithdrawalSearchTest` | Filtros del listado (status, rango de fechas, búsqueda por CBU parcial o cuenta exacta) |
-| `BankServiceMockTest` | Contrato de idempotencia sobre el que se apoya **C6** (5 escenarios de caché + query). Corre contra Postgres real (no una unidad pura): desde que la verdad de fondo del mock vive en `bank_mock_ledger`/`bank_mock_in_flight` (sección 8), ya no hay lógica en memoria que aislar de la base |
+| `BankServiceMockTest` | Contrato de idempotencia sobre el que se apoya **C6** (5 escenarios de caché + query), contra Postgres real |
 | `RiskServiceMockTest` | Convención de forzado por decimales (barato, evita que un cambio la rompa en silencio y arruine las demos) |
 | `AccountRepositoryTest` | Sanity de Flyway y del mapeo de la entidad |
+
+Dos filas de esa tabla necesitan una aclaración que no entra en una celda: `RiskEvaluationPollerTest`
+tiene un caso dedicado que pasa por el `tick()` real (no `processBatch()` directo) — es la guarda
+de regresión del bug de auto-invocación de la sección 3. Y el test de concurrencia de
+`ReconciliationPollerTest` no afirma que la consulta al banco corra exactamente una vez, a
+diferencia de los otros dos — el claim de la reconciliación solo bumpea `requested_at`, así que
+una resolución lenta puede legítimamente dejar un retiro elegible de nuevo (self-healing, no un
+bug); lo que sí afirma es que el estado final nunca se aplica dos veces, gracias al guard de la
+sección 8.
 
 **Postgres real vía Testcontainers, no H2.** `SKIP LOCKED` y el comportamiento de EvalPlanQual
 bajo `READ COMMITTED` son justamente lo que se está testeando; contra H2 los tests pasarían sin
@@ -940,24 +967,14 @@ probar nada de lo que importa. Un test de concurrencia contra un motor que no re
 semántica de locking del motor de producción es peor que no tener test, porque da confianza
 falsa.
 
-Dos decisiones de infraestructura de test que salieron de problemas reales:
-
-- **Container singleton** en `AbstractIntegrationTest`, deliberadamente *sin*
-  `@Testcontainers`/`@Container`: esa extensión ata el ciclo de vida del container a cada clase
-  de test, pero el campo estático es compartido por todas las subclases — el `afterAll` de una
-  clase frenaba el container mientras otra lo seguía usando, con fallos intermitentes de
-  conexión. Se arranca una vez en un bloque estático y lo limpia el shutdown hook de
-  Testcontainers.
-- **`scheduling.enabled=false` en el perfil `test`** (`config/SchedulingConfig` con
-  `@ConditionalOnProperty`): si los `@Scheduled` siguen latiendo durante el test, compiten con
-  las invocaciones explícitas del test y lo vuelven no determinístico. Los tests manejan el
-  poller a mano.
-- **Dobles de test dedicados**: `TestRiskService` / `TestBankService` (perfil `test`) son
-  instantáneos, programables por cuenta/key y **cuentan invocaciones** — sin ese contador no se
-  puede afirmar "se evaluó exactamente una vez". Los mocks realistas (`RiskServiceMock`,
-  `BankServiceMock`, con sus 1-3s y 3-10s) quedan para la demo manual, y su lógica de
-  forzado/caché se testea directamente con el constructor de latencia casi cero, sin duplicar
-  la semántica en dos lugares distintos.
+Tres decisiones de infraestructura de test que salieron de problemas reales: **container
+singleton** en `AbstractIntegrationTest`, deliberadamente sin `@Testcontainers`/`@Container` (esa
+extensión ata el ciclo de vida a cada clase, y el `afterAll` de una frenaba el container mientras
+otra lo seguía usando); **`scheduling.enabled=false`** en el perfil `test`, para que los
+`@Scheduled` no compitan con las invocaciones explícitas y vuelvan el test no determinístico; y
+**dobles de test dedicados** (`TestRiskService`/`TestBankService`), instantáneos y que cuentan
+invocaciones — sin ese contador no se puede afirmar "se evaluó exactamente una vez". Los mocks
+realistas (con latencia real) quedan para la demo manual.
 
 **Qué NO se testeó, a propósito**:
 
@@ -980,7 +997,7 @@ cuentas; ahora afirma que existen las filas sembradas específicas).
 
 ---
 
-## 12. Supuestos ante ambigüedades del enunciado
+## 14. Supuestos ante ambigüedades del enunciado
 
 - **CBU = exactamente 22 dígitos**, validado en dos capas: `@Pattern(regexp = "^[0-9]{22}$")`
   en `CreateWithdrawalRequest` y `CHECK (destination_cbu ~ '^[0-9]{22}$')` en la tabla. **No**
@@ -992,7 +1009,7 @@ cuentas; ahora afirma que existen las filas sembradas específicas).
   límite— para que un burst de retiros concurrentes choque contra C5 de forma visible en la
   demo.
 - **La identidad del operador es un header `X-Operator-Id`**, confiado tal cual, sin auth (ver
-  sección 13). Se registra igual en cada transición y en `withdrawal_status_history`: la
+  sección 15). Se registra igual en cada transición y en `withdrawal_status_history`: la
   ausencia de autenticación no es excusa para perder la trazabilidad.
 - **Riesgo bajo y medio se autorizan solos; alto va a revisión humana.** Implementado como
   `LOW`/`MEDIUM → AUTHORIZED`, `HIGH → PENDING_AUTHORIZATION`, y **fallo del servicio →
@@ -1021,7 +1038,7 @@ cuentas; ahora afirma que existen las filas sembradas específicas).
 
 ---
 
-## 13. Qué se dejó afuera a propósito
+## 15. Qué se dejó afuera a propósito
 
 - **Autenticación y autorización reales.** El operador llega como header `X-Operator-Id` sin
   verificar. En una versión completa: OIDC/JWT con un rol `OPERATOR`, y el actor del audit
@@ -1048,44 +1065,33 @@ cuentas; ahora afirma que existen las filas sembradas específicas).
   profundidad de cola por estado, latencia del banco y contador de reconciliaciones — es lo
   primero que se agregaría en una versión real, porque un poller que deja de drenar su cola es
   invisible hasta que alguien se queja.
-- **Paginación y exportación regulatoria** del listado.
+- **Paginación y exportación regulatoria** del listado. El endpoint ya pagina (`Pageable`), pero
+  falta exportación a un formato que compliance pueda auditar fuera del sistema (CSV/PDF con los
+  filtros aplicados). En una versión completa iría como un endpoint separado que arma el archivo
+  de forma asíncrona (un reporte grande no debería bloquear un request HTTP, mismo argumento que
+  C1) y lo deja disponible para descarga — el mismo patrón poller que ya usa el resto del sistema.
 
 ---
 
-## 14. Uso de IA
+## 16. Uso de IA
 
-Se usó **Claude Code de forma activa e intensiva** para construir este proyecto: el enunciado
-lo permite explícitamente y no tiene sentido presentarlo de otra manera. Cómo se usó, con la
-misma honestidad:
+Se usó **Claude Code de forma activa e intensiva** en todo el proyecto.
 
-- **Antes de escribir código** se armó un plan técnico y se lo sometió a **dos rondas de
-  auditoría cruzada** con agentes distintos (uno con perfil de tech lead / owner de producto,
-  otro especializado en concurrencia). La segunda ronda encontró seis problemas reales en el
-  diseño original: el pool de scheduling compartido en un solo hilo (sección 3), el settle de
-  saldo partido en dos statements (sección 7), el hueco de la reconciliación en el que una
-  llamada tardía al banco podía cruzarse con un reintento (sección 8), la semántica del mock de
-  banco mal definida (que es lo que hace testeable a C6), y dos más. Todos entraron al diseño
-  antes de la primera línea de código.
-- **La verificación fue con tests, no con lectura.** Los tests de concurrencia encontraron
-  bugs reales que ninguna revisión había visto. El más claro: `@Modifying` sin `@Transactional`
-  en `AccountRepository`. Los repositorios de Spring Data corren en transacción read-only por
-  default y Postgres rechaza el `UPDATE`, pero el fallo era **silencioso** —0 filas afectadas,
-  sin excepción— así que el código parecía correcto leyéndolo. El test de 20 hilos devolvió "0
-  éxitos, esperados 16" y expuso el problema de inmediato. Ese es el motivo por el que
-  `AccountReservationConcurrencyTest` acumula las excepciones de cada hilo en vez de
-  descartarlas: una excepción tragada ya escondió un bug real una vez.
-- **Qué aportó la IA y qué se validó**: el diseño de fondo (las tablas, la máquina de estados,
-  el mapeo condición → mecanismo) salió del trabajo con la IA y sobrevivió a la auditoría. Se
-  validó entendiendo el razonamiento de cada pieza, no aceptando el resultado: por qué
-  `SKIP LOCKED` y no ShedLock (hacen cosas opuestas, sección 5), por qué UPDATE condicional y
-  no `SELECT FOR UPDATE` (EvalPlanQual, sección 7), por qué `@Version` y no locking pesimista
-  (sección 6). Cada una de esas decisiones tiene su alternativa descartada escrita arriba
-  porque se discutió, no porque quede lindo en un documento.
-- **También hubo cosas que llevaron tiempo y no fueron código**: un problema real de
-  compatibilidad entre Testcontainers y la versión de Docker Desktop de esta máquina obligó a
-  diagnosticar en capas (versión del daemon, transporte, variables de entorno vs system
-  properties del JVM forkeado) hasta dar con la combinación que funciona, que es lo que quedó
-  documentado en `build.gradle` (sección 10).
-- **Los mensajes de commit son deliberadamente explicativos** y describen el porqué de cada
-  decisión y qué verificó cada test. El historial de git es parte de la entrega: sirve para
-  seguir en qué orden se construyó el sistema y con qué criterio.
+El plan técnico pasó, antes de escribir código, por **dos rondas de auditoría cruzada** con
+agentes distintos (tech lead/owner de producto, y especialista en concurrencia). La segunda
+encontró seis problemas reales en el diseño original —el pool de scheduling compartido
+(sección 3), el settle partido en dos statements (sección 7), el hueco de reconciliación de la
+sección 8, la semántica del mock de banco mal definida, y dos más— resueltos antes de escribir
+código.
+
+**La verificación fue con tests, no con lectura**: el bug más claro (`@Modifying` sin
+`@Transactional` en `AccountRepository`, sección 7) era silencioso —0 filas afectadas, sin
+excepción— y el código parecía correcto leyéndolo. Solo el test de 20 hilos lo expuso.
+
+Lo que aportó la IA se validó entendiendo el razonamiento, no aceptando el resultado: por qué
+`SKIP LOCKED` y no ShedLock, UPDATE condicional y no `SELECT FOR UPDATE`, `@Version` y no locking
+pesimista — cada una tiene su alternativa descartada en su propia sección porque se discutió, no
+porque quede lindo en un documento.
+
+Los commits son explicativos a propósito: describen el porqué de cada decisión y qué verificó
+cada test.
