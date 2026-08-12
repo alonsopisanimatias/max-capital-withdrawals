@@ -118,7 +118,7 @@ public class BankServiceMock implements BankService {
         BankMockLedgerEntry entry = existing.get();
         return switch (entry.getOutcome()) {
             case APPLIED, TIMEOUT_APPLIED_TRUE -> new BankTransferResult(entry.getBankReference());
-            case REJECTED_INVALID_ACCOUNT -> throw new InvalidAccountException("Cached: destination account is invalid");
+            case REJECTED_INVALID_ACCOUNT -> throw new InvalidAccountException("En caché: la cuenta de destino es inválida");
             case TIMEOUT_APPLIED_FALSE -> {
                 // never really applied: treat as if there was no prior attempt, allow a fresh one
                 ledgerRepository.deleteById(idempotencyKey);
@@ -130,18 +130,18 @@ public class BankServiceMock implements BankService {
     private BankTransferResult resolveOutcome(UUID idempotencyKey, int forcingDigits)
             throws InvalidAccountException, InternalErrorException, BankTimeoutException {
         switch (forcingDigits) {
-            case 13 -> throw new InternalErrorException("Forced internal error via amount convention (.13)");
+            case 13 -> throw new InternalErrorException("Error interno forzado por convención de monto (.13)");
             case 14 -> {
                 storeTimeoutGroundTruth(idempotencyKey, true);
-                throw new BankTimeoutException("Forced timeout, applied=true via amount convention (.14)");
+                throw new BankTimeoutException("Timeout forzado (aplicado) por convención de monto (.14)");
             }
             case 15 -> {
                 storeTimeoutGroundTruth(idempotencyKey, false);
-                throw new BankTimeoutException("Forced timeout, applied=false via amount convention (.15)");
+                throw new BankTimeoutException("Timeout forzado (no aplicado) por convención de monto (.15)");
             }
             case 16 -> {
                 ledgerRepository.save(new BankMockLedgerEntry(idempotencyKey, BankMockLedgerEntry.Outcome.REJECTED_INVALID_ACCOUNT, null));
-                throw new InvalidAccountException("Forced invalid account via amount convention (.16)");
+                throw new InvalidAccountException("Cuenta inválida forzada por convención de monto (.16)");
             }
             case 50 -> {
                 return storeApplied(idempotencyKey);
@@ -155,14 +155,14 @@ public class BankServiceMock implements BankService {
     private BankTransferResult resolveRandomOutcome(UUID idempotencyKey) throws InvalidAccountException, InternalErrorException, BankTimeoutException {
         double roll = ThreadLocalRandom.current().nextDouble();
         if (roll < 0.05) {
-            throw new InternalErrorException("Bank internal error");
+            throw new InternalErrorException("Error interno del banco");
         } else if (roll < 0.08) {
             boolean applied = ThreadLocalRandom.current().nextBoolean();
             storeTimeoutGroundTruth(idempotencyKey, applied);
-            throw new BankTimeoutException("Bank did not respond in time");
+            throw new BankTimeoutException("El banco no respondió a tiempo");
         } else if (roll < 0.10) {
             ledgerRepository.save(new BankMockLedgerEntry(idempotencyKey, BankMockLedgerEntry.Outcome.REJECTED_INVALID_ACCOUNT, null));
-            throw new InvalidAccountException("Destination account is invalid");
+            throw new InvalidAccountException("La cuenta de destino es inválida");
         }
         return storeApplied(idempotencyKey);
     }

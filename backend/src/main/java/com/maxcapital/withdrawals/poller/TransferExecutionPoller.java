@@ -162,7 +162,7 @@ public class TransferExecutionPoller {
             // interrupt a plain blocking call without cooperation) — it occupies a bankCallExecutor
             // slot until it actually returns, which is why that pool's own size is what really
             // bounds worst-case concurrency against the bank, not this timeout.
-            outcomeService.markAwaitingReconciliation(transfer.getId(), "Client-side timeout waiting for bank response");
+            outcomeService.markAwaitingReconciliation(transfer.getId(), "Timeout del cliente esperando la respuesta del banco");
         } catch (IdempotentRequestInProgressException e) {
             // shouldn't happen in normal operation (SKIP LOCKED means only one worker processes
             // this withdrawal at a time) — leave state as-is, reconciliation will resolve it
