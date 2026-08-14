@@ -947,7 +947,7 @@ buscó que cada condición crítica con concurrencia tenga un test que la ejerci
 | `WithdrawalServiceAuthorizationTest` | **C4** — authorize/reject felices, precondición de estado inválido, y la carrera authorize-vs-reject con verificación del saldo reservado final |
 | `TransferExecutionPollerTest` | **C1/C6** — los 4 desenlaces del banco (éxito, cuenta inválida, error interno, timeout) más **C3** para `lockNextBatchForTransfer`: 12 retiros, 2 pollers concurrentes, `executionCount == 1` para cada uno |
 | `ReconciliationPollerTest` | **C6** — timeout aplicado resuelto a `EXECUTED`; timeout no aplicado, reseteado y reintentado con éxito; fallas repetidas del lookup escalando a `MANUAL_REVIEW` con salida por operador; más **C3** para `lockNextBatchForReconciliation` (ver nota debajo sobre su invariante de concurrencia) |
-| `WithdrawalSearchTest` | Filtros del listado (status, rango de fechas, búsqueda por CBU parcial o cuenta exacta) |
+| `WithdrawalSearchTest` | Filtros del listado (status, rango de fechas, búsqueda por CBU parcial, id de retiro parcial o cuenta exacta) |
 | `BankServiceMockTest` | Contrato de idempotencia sobre el que se apoya **C6** (5 escenarios de caché + query), contra Postgres real |
 | `RiskServiceMockTest` | Convención de forzado por decimales (barato, evita que un cambio la rompa en silencio y arruine las demos) |
 | `AccountRepositoryTest` | Sanity de Flyway y del mapeo de la entidad |

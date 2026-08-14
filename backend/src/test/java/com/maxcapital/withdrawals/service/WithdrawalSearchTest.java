@@ -72,6 +72,18 @@ class WithdrawalSearchTest extends AbstractIntegrationTest {
     }
 
     @Test
+    void searchMatchesPartialWithdrawalId() {
+        UUID accountId = seedAccount();
+        testRiskService.forAccount(accountId, RiskLevel.LOW);
+        Withdrawal withdrawal = withdrawalService.createWithdrawal(accountId, CBU_A, new BigDecimal("10.00"));
+
+        String middleSubstring = withdrawal.getId().toString().substring(9, 13);
+        Page<Withdrawal> byId = withdrawalService.search(null, null, null, middleSubstring, PageRequest.of(0, 20));
+
+        assertThat(byId.getContent()).extracting(Withdrawal::getId).contains(withdrawal.getId());
+    }
+
+    @Test
     void searchMatchesExactAccountId() {
         UUID accountId = seedAccount();
         testRiskService.forAccount(accountId, RiskLevel.LOW);

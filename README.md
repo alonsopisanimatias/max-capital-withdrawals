@@ -253,7 +253,7 @@ Query params de `GET /api/withdrawals`, todos opcionales y combinables:
 | --- | --- |
 | `status` | Match exacto contra un `WithdrawalStatus` (ej. `PENDING_AUTHORIZATION`). |
 | `dateFrom` / `dateTo` | Instantes ISO-8601 (`2026-08-10T00:00:00Z`), inclusive, matcheados contra `createdAt`. |
-| `search` | Match parcial sobre el CBU de destino, o un id de cuenta exacto cuando el término parsea como UUID. |
+| `search` | Match parcial sobre el CBU de destino o sobre el id del retiro, o un id de cuenta exacto cuando el término parsea como UUID. |
 | `page` / `size` / `sort` | Paginación estándar de Spring. Defaults: `size=20`, `sort=createdAt` ascendente; ej. `sort=createdAt,desc`. |
 
 Las cuatro acciones de operador devuelven `409` cuando el retiro ya no está en el estado esperado

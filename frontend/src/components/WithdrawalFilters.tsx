@@ -70,10 +70,10 @@ export function WithdrawalFiltersBar({ filters, onChange }: Props) {
         {rangeInvalid && <span className="field-error">"Desde" es posterior a "Hasta"</span>}
       </div>
       <label style={{ flex: 1, minWidth: 200 }}>
-        Buscar (CBU o cuenta)
+        Buscar (ID, CBU o cuenta)
         <input
           type="text"
-          placeholder="CBU parcial o UUID de cuenta"
+          placeholder="ID de retiro, CBU parcial o UUID de cuenta"
           value={searchInput}
           onChange={(e) => setSearchInput(e.target.value)}
         />

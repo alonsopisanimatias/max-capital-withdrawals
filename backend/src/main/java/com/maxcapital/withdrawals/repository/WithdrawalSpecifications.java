@@ -31,11 +31,12 @@ public final class WithdrawalSpecifications {
     }
 
     /**
-     * "Search by account or CBU" (matches the operator-facing requirement): partial match on
-     * the destination CBU, plus an exact match on the account id when the search term happens
-     * to parse as a UUID. There's no denormalized account number on withdrawal to search
-     * against without joining account — out of scope for this backoffice screen, documented
-     * in DECISIONS.md rather than added as an undiscussed join.
+     * "Search by account, CBU, or withdrawal id" (matches the operator-facing requirement):
+     * partial match on the destination CBU, partial case-insensitive match on the withdrawal's
+     * own id, plus an exact match on the account id when the search term happens to parse as a
+     * UUID. There's no denormalized account number on withdrawal to search against without
+     * joining account — out of scope for this backoffice screen, documented in DECISIONS.md
+     * rather than added as an undiscussed join.
      */
     public static Specification<Withdrawal> matchesSearch(String search) {
         return (root, query, cb) -> {
@@ -44,11 +45,12 @@ public final class WithdrawalSpecifications {
             }
             String trimmed = search.trim();
             Predicate cbuMatch = cb.like(root.get("destinationCbu"), "%" + trimmed + "%");
+            Predicate idMatch = cb.like(cb.lower(root.get("id").as(String.class)), "%" + trimmed.toLowerCase() + "%");
             try {
                 Predicate accountMatch = cb.equal(root.get("accountId"), UUID.fromString(trimmed));
-                return cb.or(cbuMatch, accountMatch);
+                return cb.or(cbuMatch, idMatch, accountMatch);
             } catch (IllegalArgumentException notAUuid) {
-                return cbuMatch;
+                return cb.or(cbuMatch, idMatch);
             }
         };
     }
