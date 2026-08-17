@@ -421,7 +421,7 @@ alternativa sería un hint específico de Hibernate; una query nativa deja expl�
 qué se está pidiendo.
 
 **Verificación**: `RiskEvaluationPollerTest.concurrentPollersNeverEvaluateTheSameWithdrawalTwice`
-lanza 2 pollers simulados (2 hilos = 2 instancias) haciendo 5 ticks cada uno sobre 12 retiros
+lanza 2 pollers simulados (2 hilos = 2 instancias) haciendo 15 ticks cada uno sobre 12 retiros
 (más que el batch de 5, para forzar varios lotes) y afirma que
 `testRiskService.invocationCount(accountId) == 1` para cada uno, y que los 12 terminan
 procesados. Las dos mitades de C3 en un solo test.
